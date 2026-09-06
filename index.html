@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ballet AI Technique Analyzer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Karla:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    /* ── Reset & base ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      font-family: 'Karla', 'Georgia', sans-serif;
+      background: #E8EAEB;
+      color: #4D4444;
+      padding: 40px 40px 80px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Layout container ── */
+    .wrap {
+      max-width: 1080px;
+      margin: 0 auto;
+    }
+
+    /* ── Warning banner ── */
+    .warning {
+      background: #FAD4F8;
+      border: 1px solid #f0b8ec;
+      border-radius: 10px;
+      padding: 22px 26px;
+      margin-bottom: 32px;
+      line-height: 1.7;
+    }
+    .warning-label {
+      display: block;
+      font-size: 1.1rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #4D4444;
+      font-weight: bold;
+      margin-bottom: 10px;
+      font-family: 'Karla', sans-serif;
+    }
+    .warning p {
+      font-size: 1rem;
+      color: #4D4444;
+    }
+
+    /* ── Card ── */
+    .card {
+      background: #000000;
+      border: 1px solid #e2dede;
+      border-radius: 12px;
+      padding: 38px 34px;
+      margin-bottom: 24px;
+    }
+
+    /* ── Form groups ── */
+    .field {
+      margin-bottom: 28px;
+    }
+    .field:last-child { margin-bottom: 0; }
+
+    label {
+      display: block;
+      font-size: 1.2rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #ffffff;
+      margin-bottom: 12px;
+      font-family: 'Karla', sans-serif;
+    }
+    .optional-tag {
+      font-size: 0.8rem;
+      letter-spacing: 0.08em;
+      color: #9c9292;
+      margin-left: 8px;
+      text-transform: uppercase;
+      font-family: 'Karla', sans-serif;
+    }
+
+    input[type="text"],
+    select,
+    textarea {
+      width: 100%;
+      background: #F7F5F5;
+      border: 1px solid #e2dede;
+      border-radius: 6px;
+      color: #4D4444;
+      font-family: 'Karla', sans-serif;
+      font-size: 1rem;
+      padding: 16px 20px;
+      outline: none;
+      transition: border-color 0.2s;
+      appearance: none;
+      -webkit-appearance: none;
+    }
+    input[type="text"]:focus,
+    select:focus,
+    textarea:focus {
+      border-color: #FAD4F8;
+    }
+    input[type="text"]::placeholder,
+    textarea::placeholder {
+      color: #b3aaaa;
+    }
+
+    /* Custom select arrow */
+    .select-wrap {
+      position: relative;
+    }
+    .select-wrap::after {
+      content: '';
+      position: absolute;
+      right: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 0;
+      height: 0;
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-top: 6px solid #4D4444;
+      pointer-events: none;
+    }
+    select { padding-right: 36px; cursor: pointer; }
+    select option { background: #F7F5F5; color: #4D4444; }
+
+    textarea {
+      resize: vertical;
+      min-height: 170px;
+      line-height: 1.6;
+    }
+
+    /* File input */
+    .file-wrap {
+      position: relative;
+    }
+    input[type="file"] {
+      width: 100%;
+      background: #F7F5F5;
+      border: 1px solid #e2dede;
+      border-radius: 6px;
+      color: #4D4444;
+      font-family: 'Karla', sans-serif;
+      font-size: 1.05rem;
+      padding: 14px 18px;
+      cursor: pointer;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="file"]:focus { border-color: #FAD4F8; }
+    input[type="file"]::file-selector-button {
+      background: #FAD4F8;
+      border: 1px solid #f0b8ec;
+      border-radius: 4px;
+      color: #4D4444;
+      cursor: pointer;
+      font-family: 'Karla', sans-serif;
+      font-size: 0.95rem;
+      letter-spacing: 0.02em;
+      padding: 9px 16px;
+      margin-right: 16px;
+      transition: background 0.2s;
+    }
+    input[type="file"]::file-selector-button:hover {
+      background: #f5c2f2;
+    }
+
+    /* ── Submit button ── */
+    .btn-submit {
+      width: 100%;
+      background: #FAD4F8;
+      border: none;
+      border-radius: 10px;
+      color: #000000;
+      cursor: pointer;
+      font-family: 'Karla', sans-serif;
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      padding: 20px 24px;
+      transition: opacity 0.2s, transform 0.1s;
+      margin-top: 10px;
+    }
+    .btn-submit:hover:not(:disabled) {
+      opacity: 0.88;
+      transform: translateY(-1px);
+    }
+    .btn-submit:active:not(:disabled) { transform: translateY(0); }
+    .btn-submit:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    /* ── Status bar ── */
+    .status-bar {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      background: #F7F5F5;
+      border: 1px solid #e2dede;
+      border-radius: 6px;
+      padding: 16px 20px;
+      margin-top: 18px;
+      font-size: 1rem;
+      color: #4D4444;
+      letter-spacing: 0.02em;
+    }
+    .status-bar.visible { display: flex; }
+
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2px solid #e2dede;
+      border-top-color: #FAD4F8;
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Results card ── */
+    .results-card {
+      display: none;
+      background: #ffffff;
+      border: 1px solid #e2dede;
+      border-radius: 12px;
+      padding: 38px 34px;
+    }
+    .results-card {
+      border-radius: 12px;
+    }
+    .results-card.visible { display: block; }
+
+    .results-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 26px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid #e2dede;
+    }
+    .results-header-icon {
+      width: 34px;
+      height: 34px;
+      background: #FAD4F8;
+      border: 1px solid #f0b8ec;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+      flex-shrink: 0;
+      color: #4D4444;
+    }
+    .results-header-text {
+      font-size: 1.1rem;
+      letter-spacing: 0.03em;
+      color: #4D4444;
+      font-family: 'Karla', sans-serif;
+    }
+
+    /* Critique text block */
+    #correctionDisplay {
+      font-size: 1.1rem;
+      line-height: 1.85;
+      color: #4D4444;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #correctionDisplay strong,
+    #correctionDisplay b {
+      color: #4D4444;
+      font-weight: bold;
+    }
+
+    /* Error state */
+    .error-text {
+      color: #b5524f;
+      font-size: 0.88rem;
+      line-height: 1.6;
+    }
+
+    /* ── Footer note ── */
+    .footer-note {
+      text-align: center;
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+      color: #9c9292;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <!-- Warning Banner -->
+    <div class="warning">
+      <span class="warning-label">Important — Before You Upload</span>
+      <p>
+        For accurate technique metrics, you must wear tight, form-fitting dancewear
+        like a leotard and tights. Baggy clothing introduces fabric noise that masks
+        your joint alignment and may cause the AI to misread your body's true position.
+      </p>
+    </div>
+
+    <!-- Upload Form -->
+    <div class="card">
+
+      <!-- Username -->
+      <div class="field">
+        <label for="usernameInput">Dancer Name / Username</label>
+        <input
+          type="text"
+          id="usernameInput"
+          name="username"
+          placeholder="Your name or studio ID"
+          autocomplete="off"
+        />
+      </div>
+
+      <!-- Skill Level -->
+      <div class="field">
+        <label for="skillDropdown">Skill Level</label>
+        <div class="select-wrap">
+          <select id="skillDropdown" name="skill_level">
+            <option value="Adult / Recreational Beginner">Adult / Recreational Beginner</option>
+            <option value="Advanced Beginner">Advanced Beginner</option>
+            <option value="Intermediate Student / Syllabus Training">Intermediate Student / Syllabus Training</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Health Specs -->
+      <div class="field">
+        <label for="healthSpecsInput">
+          Physical Notes
+          <span class="optional-tag">Optional</span>
+        </label>
+        <textarea
+          id="healthSpecsInput"
+          name="health_specs"
+          placeholder="Any injuries, structural limitations, or flexibility targets you'd like the AI to account for — e.g. right knee pain, tight hamstrings, hypermobile hips, ankle instability, working on turnout..."
+        ></textarea>
+      </div>
+
+      <!-- Video File -->
+      <div class="field">
+        <label for="balletVideo">Upload Ballet Video</label>
+        <input
+          type="file"
+          id="balletVideo"
+          name="video"
+          accept="video/*"
+        />
+      </div>
+
+      <!-- Submit -->
+      <div class="field">
+        <button
+          class="btn-submit"
+          id="submitBtn"
+          onclick="sendVideoToServer()"
+        >
+          Analyse My Technique
+        </button>
+
+        <!-- Loading status -->
+        <div class="status-bar" id="statusBar">
+          <div class="spinner" id="spinnerEl"></div>
+          <span id="statusText">Uploading your video...</span>
+        </div>
+      </div>
+
+    </div><!-- /card -->
+
+    <!-- Results -->
+    <div class="results-card" id="resultsCard">
+      <div class="results-header">
+        <div class="results-header-icon">✦</div>
+        <span class="results-header-text">AI Coaching Analysis</span>
+      </div>
+      <div id="correctionDisplay"></div>
+    </div>
+
+    <p class="footer-note">Powered by MediaPipe · Gemini 2.5 Flash · Claude 3.5 Sonnet</p>
+
+  </div><!-- /wrap -->
+
+  <script>
+    // Status message rotation during processing
+    const STATUS_STEPS = [
+      "Uploading your video...",
+      "Running MediaPipe pose tracking...",
+      "Extracting joint angles and movement phases...",
+      "Analysing technique data with Gemini...",
+      "Generating coaching feedback with Claude...",
+      "Finalising your personalised critique..."
+    ];
+
+    let statusInterval = null;
+
+    function setLoading(active) {
+      const btn       = document.getElementById("submitBtn");
+      const bar       = document.getElementById("statusBar");
+      const statusTxt = document.getElementById("statusText");
+
+      if (active) {
+        btn.disabled = true;
+        bar.classList.add("visible");
+        statusTxt.textContent = STATUS_STEPS[0];
+        let stepIdx = 0;
+        statusInterval = setInterval(function () {
+          stepIdx = (stepIdx + 1) % STATUS_STEPS.length;
+          statusTxt.textContent = STATUS_STEPS[stepIdx];
+        }, 5500);
+      } else {
+        btn.disabled = false;
+        bar.classList.remove("visible");
+        clearInterval(statusInterval);
+        statusInterval = null;
+      }
+    }
+
+    function showResult(html, isError) {
+      var card    = document.getElementById("resultsCard");
+      var display = document.getElementById("correctionDisplay");
+
+      display.innerHTML = "";
+
+      if (isError) {
+        var errEl = document.createElement("p");
+        errEl.className = "error-text";
+        errEl.innerHTML = html;
+        display.appendChild(errEl);
+      } else {
+        // Render bold markdown (**text**) to <strong>
+        var rendered = html
+          .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+          .replace(/•/g, "•");
+        display.innerHTML = rendered;
+      }
+
+      card.classList.add("visible");
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    async function sendVideoToServer() {
+      // ── Gather inputs ──
+      var username     = document.getElementById("usernameInput").value.trim();
+      var skillLevel   = document.getElementById("skillDropdown").value;
+      var healthSpecs  = document.getElementById("healthSpecsInput").value.trim();
+      var videoInput   = document.getElementById("balletVideo");
+
+      // ── Validate ──
+      if (!username) {
+        alert("Please enter your dancer name or username before submitting.");
+        return;
+      }
+      if (!videoInput.files || videoInput.files.length === 0) {
+        alert("Please select a ballet video file to upload.");
+        return;
+      }
+
+      var videoFile = videoInput.files[0];
+
+      // ── Build FormData ──
+      var formData = new FormData();
+      formData.append("username",    username);
+      formData.append("skill_level", skillLevel);
+      formData.append("health_specs", healthSpecs);
+      formData.append("video",       videoFile);
+
+      // ── UI: enter loading state ──
+      setLoading(true);
+      document.getElementById("resultsCard").classList.remove("visible");
+
+      try {
+        var response = await fetch("http://127.0.0.1:5000/upload-ballet", {
+          method: "POST",
+          body:   formData
+        });
+
+        if (!response.ok) {
+          var errBody = null;
+          try { errBody = await response.json(); } catch (_) {}
+          var errMsg = (errBody && errBody.error)
+            ? errBody.error
+            : "Server returned status " + response.status + ".";
+          throw new Error(errMsg);
+        }
+
+        var data = await response.json();
+
+        if (data.corrections) {
+          showResult(data.corrections, false);
+        } else if (data.error) {
+          showResult("Server error: " + data.error, true);
+        } else {
+          showResult("Unexpected response from server. Please try again.", true);
+        }
+
+      } catch (err) {
+        var isConnErr = (err.message && (
+          err.message.toLowerCase().includes("failed to fetch") ||
+          err.message.toLowerCase().includes("networkerror") ||
+          err.message.toLowerCase().includes("load failed")
+        ));
+
+        var msg = isConnErr
+          ? "Cannot reach the local server at <code>http://127.0.0.1:5000</code>.<br><br>"
+            + "Make sure the Ballet AI server is running on your machine:<br>"
+            + "<code>python app.py</code>"
+          : "Error: " + err.message;
+
+        showResult(msg, true);
+      } finally {
+        setLoading(false);
+      }
+    }
+  </script>
+</body>
+</html>

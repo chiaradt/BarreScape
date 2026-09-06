@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+.eggs/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# VS Code and IDEs
+.vscode/
+.idea/
+
+# Logs and database
+*.log
+history_db.json
+
+# Environment variables
+.env
+*.env
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+
+# Ignore Python bytecode and caches
+*.pyc
+
+# Ignore large model files if user wants to keep them out of repo
+# (pose_landmarker_lite.task is small in this repo; only uncomment if >50MB)
+# pose_landmarker_lite.task
+
+# Stray VS Code installation accidentally inside project folder
+Microsoft VS Code/
