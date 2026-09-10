@@ -388,11 +388,7 @@ Your ONLY task is to read the raw MediaPipe pose tracking timeline below and out
 
 Rules:
 - Be purely descriptive and data-driven. No coaching language, no advice.
-- At each detected hold or transition, attempt to identify the actual ballet step or position from the body-shape and joint-angle pattern, such as 'arabesque', 'attitude', 'chassé', 'tendu', 'plié', 'relevé', 'pirouette', 'grand battement', 'passé', 'a la seconde', 'first position', 'second position', 'fifth position', or 'demi-plié'.
-- For standing or basic floor positions, specifically look for classic ballet terminology when the joint/turnout pattern clearly indicates it: 'first position', 'second position', 'fifth position', 'demi-plié', 'grand plié', 'relevé in first position', or 'simple standing alignment in first position'. Do not fall back to vague biomechanical labels like 'two-leg stance' when the data clearly supports a real ballet position.
-- If the exact step cannot be identified confidently, describe the general body shape instead, such as 'one leg extended behind at hip height', 'single-leg balance with knee lifted', 'straight supporting leg with torso rotated', or 'small side step with weight shifting'. Do not use vague labels like 'static pose' or 'transition' as the primary name when a more specific motion or shape is visible.
-- When the same step or position appears more than once, number the instances in order as they appear in the video, such as '1st arabesque', '2nd arabesque', '1st tendu', '2nd tendu', '1st fifth position', '2nd fifth position'. Use the same numbering consistently across the list.
-- Each bullet must name the error type and describe what the metric concretely shows, and should include the most likely step/position label or the general body shape description so later coaching can reference specific movements rather than generic timestamps alone.
+- Each bullet must name the error type and describe what the metric concretely shows.
 - Group related issues logically (e.g. all knee observations together).
 - Only flag clear anomalies — do NOT mention metrics within normal range.
 - Maximum 12 bullets.
@@ -401,7 +397,7 @@ RAW TRACKING DATA:
 {timeline_text}
 
 Output format — return ONLY this bulleted list, nothing else:
-• [ERROR TYPE]: [Step/position label or general shape] — objective description of what the metric shows
+• [ERROR TYPE]: Objective description of what the metric shows
 • [ERROR TYPE]: ...
 """
 
@@ -448,7 +444,7 @@ Treat these as equal-weight companion tools to help you decode raw screen metric
 - If you need to mention timing in a video, use natural spoken timestamps such as 'about 4 seconds in' or 'near the end of the phrase', not exact decimal ranges. Round to natural spoken language and keep the focus on where in the movement to look, not on raw numeric measurements.
 - Name the actual step or movement in your coaching language, such as 'tendu', 'plié', 'arabesque', 'attitude', 'relevé', 'grand battement', 'pirouette', or 'port de bras'. Do not use generic labels like 'static pose', 'position', or 'alignment issue' when the context clearly indicates a specific movement. Infer the movement from context if it is not explicitly named.
 - Use teacher-like cues, not generic fitness or anatomy phrases. Prefer real studio language such as 'pull up the kneecap', 'stand taller through the crown', 'keep the hip over the foot', 'lengthen the back of the neck', 'reach the toes', 'lift the chest without pinching the lower back', 'bring the shoulder blade down and wide', 'straighten the standing leg', 'keep the weight over the middle of the foot', 'soften the knee', and 'draw the leg out from the hip'. Avoid clinical or fitness wording such as 'engage', 'activate', 'deviation', 'compression', 'stabilize', 'anterior pelvic tilt', 'deviated alignment', 'muscle activation', or other generic exercise-language phrasing.
-- When the Gemini summary names a specific step or position with numbering, use that exact movement naming in the critique and refer to it as '1st arabesque', '2nd attitude', or whichever label appears. Do not collapse the feedback back into generic timestamps alone when a numbered step label is available.
+- When the Gemini summary names a specific step or position with numbering, use that exact movement naming in the critique and refer to it as '1st arabesque', '2nd attitude', or whichever label appears. Do not collapse the feedback back into generic timestamps alone when a numbered step label is available. Always pair the named/numbered step together with its natural spoken timestamp in the same sentence, e.g. 'in your 1st arabesque, around 4 seconds in' — never state the step name alone without also giving its approximate timing, and never give a timestamp alone without naming the step if a name is available.
 - Be honest about progress. Only call out improvement when the data shows a genuine, meaningful difference from the previous session. If the metrics are nearly identical to last time, say that plainly and do not fabricate praise.
 
 ━━━ PHYSICAL CAPABILITY COMPASSION RULE ━━━
@@ -508,12 +504,7 @@ Please produce your full ballet coaching critique following the system output st
     for block in response.content:
         if getattr(block, "type", None) == "text":
             text_parts.append(block.text)
-
-    raw_text = "".join(text_parts)
-    print("[DEBUG] Claude raw response start")
-    print(raw_text)
-    print("[DEBUG] Claude raw response end")
-    return raw_text
+    return "".join(text_parts)
 
 
 # ---------------------------------------------------------------------------
