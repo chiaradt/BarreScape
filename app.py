@@ -590,6 +590,7 @@ def ping():
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    port = os.environ.get('PORT', 5000)
     print("\n" + "=" * 62)
     print("  Ballet AI Technique Analysis Server  v1.0")
     print("=" * 62)
@@ -599,9 +600,9 @@ if __name__ == "__main__":
     print(f"  Ballet Rules     : {BALLET_RULES_PATH} ({'found' if os.path.exists(BALLET_RULES_PATH) else 'not found — optional'})")
     print(f"  Pose Model       : {MODEL_PATH} ({'ready' if os.path.exists(MODEL_PATH) else 'will download on first request'})")
     print("=" * 62)
-    print("  Server           : http://127.0.0.1:5000")
-    print("  Upload endpoint  : POST http://127.0.0.1:5000/upload-ballet")
-    print("  Health check     : GET  http://127.0.0.1:5000/ping")
+    print(f"  Server           : http://0.0.0.0:{port}")
+    print(f"  Upload endpoint  : POST http://0.0.0.0:{port}/upload-ballet")
+    print(f"  Health check     : GET  http://0.0.0.0:{port}/ping")
     print("=" * 62 + "\n")
 
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    app.run(debug=True, host='0.0.0.0', port=port)
