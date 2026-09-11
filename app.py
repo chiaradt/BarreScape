@@ -519,10 +519,22 @@ def upload_ballet():
 
     # Validate video file
     if "video" not in request.files:
+        print(
+            f"[400] /upload-ballet rejected: missing 'video' field; "
+            f"form_fields={list(request.form.keys())}, "
+            f"file_fields={list(request.files.keys())}, "
+            f"content_type={request.content_type}"
+        )
         return jsonify({"error": "No video file provided. Include a 'video' field in the multipart form."}), 400
 
     video_file = request.files["video"]
     if not video_file or video_file.filename == "":
+        print(
+            f"[400] /upload-ballet rejected: empty video file; "
+            f"filename={getattr(video_file, 'filename', None)!r}, "
+            f"form_fields={list(request.form.keys())}, "
+            f"file_fields={list(request.files.keys())}"
+        )
         return jsonify({"error": "Empty video file received."}), 400
 
     # Save to a temp file

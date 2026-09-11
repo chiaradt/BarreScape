@@ -481,7 +481,7 @@
       document.getElementById("resultsCard").classList.remove("visible");
 
       try {
-        var response = await fetch("http://127.0.0.1:5000/upload-ballet", {
+        var response = await fetch("https://barrescape.onrender.com/upload-ballet", {
           method: "POST",
           body:   formData
         });
@@ -513,9 +513,8 @@
         ));
 
         var msg = isConnErr
-          ? "Cannot reach the local server at <code>http://127.0.0.1:5000</code>.<br><br>"
-            + "Make sure the Ballet AI server is running on your machine:<br>"
-            + "<code>python app.py</code>"
+          ? "Cannot reach the analysis server right now.<br><br>"
+            + "This can happen if the server is waking up after being idle — please wait a moment and try again."
           : "Error: " + err.message;
 
         showResult(msg, true);
