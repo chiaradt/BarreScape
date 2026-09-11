@@ -1,6 +1,6 @@
 Flask
 Flask-Cors
-opencv-python
+opencv-python-headless
 numpy
 mediapipe
 google-genai
