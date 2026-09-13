@@ -9,6 +9,7 @@ import json
 import math
 import tempfile
 import datetime
+import traceback
 import urllib.request
 
 import cv2
@@ -512,37 +513,46 @@ Please produce your full ballet coaching critique following the system output st
 # ---------------------------------------------------------------------------
 @app.route("/upload-ballet", methods=["POST"])
 def upload_ballet():
-    # Extract form parameters
-    username     = (request.form.get("username")     or "anonymous").strip()
-    skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
-    health_specs = (request.form.get("health_specs") or "").strip()
-
-    # Validate video file
-    if "video" not in request.files:
-        print(
-            f"[400] /upload-ballet rejected: missing 'video' field; "
-            f"form_fields={list(request.form.keys())}, "
-            f"file_fields={list(request.files.keys())}, "
-            f"content_type={request.content_type}"
-        )
-        return jsonify({"error": "No video file provided. Include a 'video' field in the multipart form."}), 400
-
-    video_file = request.files["video"]
-    if not video_file or video_file.filename == "":
-        print(
-            f"[400] /upload-ballet rejected: empty video file; "
-            f"filename={getattr(video_file, 'filename', None)!r}, "
-            f"form_fields={list(request.form.keys())}, "
-            f"file_fields={list(request.files.keys())}"
-        )
-        return jsonify({"error": "Empty video file received."}), 400
-
-    # Save to a temp file
-    suffix   = os.path.splitext(video_file.filename or ".mp4")[1] or ".mp4"
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-    os.close(tmp_fd)
+    print(
+        f"[REQUEST] /upload-ballet started: method={request.method}, "
+        f"content_type={request.content_type}, content_length={request.content_length}",
+        flush=True,
+    )
+    tmp_path = None
 
     try:
+        # Extract form parameters
+        username     = (request.form.get("username")     or "anonymous").strip()
+        skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
+        health_specs = (request.form.get("health_specs") or "").strip()
+
+        # Validate video file
+        if "video" not in request.files:
+            print(
+                f"[400] /upload-ballet rejected: missing 'video' field; "
+                f"form_fields={list(request.form.keys())}, "
+                f"file_fields={list(request.files.keys())}, "
+                f"content_type={request.content_type}",
+                flush=True,
+            )
+            return jsonify({"error": "No video file provided. Include a 'video' field in the multipart form."}), 400
+
+        video_file = request.files["video"]
+        if not video_file or video_file.filename == "":
+            print(
+                f"[400] /upload-ballet rejected: empty video file; "
+                f"filename={getattr(video_file, 'filename', None)!r}, "
+                f"form_fields={list(request.form.keys())}, "
+                f"file_fields={list(request.files.keys())}",
+                flush=True,
+            )
+            return jsonify({"error": "Empty video file received."}), 400
+
+        # Save to a temp file
+        suffix   = os.path.splitext(video_file.filename or ".mp4")[1] or ".mp4"
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(tmp_fd)
+
         video_file.save(tmp_path)
 
         # Load history and ballet rules
@@ -586,10 +596,12 @@ def upload_ballet():
         return jsonify({"corrections": critique})
 
     except Exception as exc:
+        print(f"[500] /upload-ballet failed: {exc!r}", flush=True)
+        traceback.print_exc()
         return jsonify({"error": f"Server error: {str(exc)}"}), 500
 
     finally:
-        if os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
