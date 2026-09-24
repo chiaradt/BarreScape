@@ -248,9 +248,9 @@ def process_video(video_path: str):
         output_segmentation_masks=False,
         running_mode=mp_vision.RunningMode.VIDEO,
         num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_pose_detection_confidence=0.65,
+        min_pose_presence_confidence=0.65,
+        min_tracking_confidence=0.65,
     )
 
     frames_data    = []
