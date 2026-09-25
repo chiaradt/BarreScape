@@ -18,7 +18,7 @@ import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks_python
 from mediapipe.tasks.python import vision as mp_vision
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from google import genai
 from google.genai import types
@@ -426,7 +426,7 @@ STRENGTHS:
     for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model="gemini-3.5-flash",
+                model="gemini-2.5-flash",
                 contents=prompt,
             )
             summary_text = response.text.strip()
@@ -447,6 +447,7 @@ def run_claude_coaching(
     health_specs:      str,
     history_data:      str,
     ballet_rules_text: str,
+    used_fallback:     bool = False,
 ) -> str:
     """
     Step 2 — Claude 3.5 Sonnet: transforms Gemini's ISSUES/STRENGTHS lists into
@@ -503,6 +504,7 @@ Almost nothing in ballet technique is simply right or wrong — it sits on a spe
 Before writing anything, privately judge every candidate observation — corrections and strengths alike — on two things: how clearly and consistently the data supports it across the clip, and how much it matters for technique, safety, or the dancer's stated focus.
 - Do not report an observation unless it is clearly and consistently supported. Do not build a comparison (between two limbs, or between sessions) unless the video actually contains both things being compared. One ambiguous frame is not a finding.
 - Base every correction on an ISSUES bullet from the Gemini summary below, and every specific compliment on a STRENGTHS bullet. Never introduce a technical claim, positive or negative, that isn't grounded in one of these bullets or in the dancer's own history data below.
+- FALLBACK MODE: if the material below is marked as raw, unfiltered MediaPipe data rather than a Gemini ISSUES/STRENGTHS summary, the filtering step didn't run. In that case you must do that filtering yourself, applying this exact same evidence bar — only report a body-part/metric pattern that is clearly and consistently shown across a meaningful portion of the data, exactly as strict as Gemini's own rules would have been. The same absolute ban on naming an unstated step or movement type still applies without exception.
 - Let this judgment control both what gets mentioned and how much space it gets. A dominant strength or a genuinely significant fault should visibly take up more of the response than something incidental. A weakly-supported observation gets dropped or folded into one brief closing line — never its own full block.
 - A session producing only one or two findings in full detail is a complete, correct response. Never pad toward a target number of issues.
 - Give a strength full, specific treatment — not a token opening line — when either: it is clearly exceptional for the dancer's stated skill level, or the data shows a real, meaningful improvement from their previous session on record. Everything else stays a brief, honest mention. Never inflate ordinary competence into false praise.
@@ -535,11 +537,18 @@ Order findings by how much they matter, most significant first. Fold anything be
 
 After all findings, close with a brief, warm, personalised encouragement note that references their specific strengths (grounded in the STRENGTHS list) and any genuine progress visible in this session. If there is no meaningful change from the last session, state that plainly instead of exaggerating progress."""
 
+    material_header = (
+        "━━━ RAW MEDIAPIPE DATA (Gemini filtering step was unavailable — filter this yourself, "
+        "applying the exact same evidence bar) ━━━"
+        if used_fallback else
+        "━━━ GEMINI TECHNICAL SUMMARY (ISSUES + STRENGTHS) ━━━"
+    )
+
     user_message = f"""Dancer name: {username}
 Skill level: {skill_level}
 Physical notes / health specs: {health_specs if health_specs else 'None.'}
 
-━━━ GEMINI TECHNICAL SUMMARY (ISSUES + STRENGTHS) ━━━
+{material_header}
 {gemini_summary}
 
 Please produce your full ballet coaching critique following the system output structure."""
@@ -572,6 +581,18 @@ Please produce your full ballet coaching critique following the system output st
 # ---------------------------------------------------------------------------
 # API Routes
 # ---------------------------------------------------------------------------
+def _friendly_error_text(exc: Exception) -> str:
+    error_text = str(exc).lower()
+    if "timeout" in error_text or "timed out" in error_text:
+        return "This is taking longer than expected. Please try again in a moment."
+    elif "503" in error_text or "unavailable" in error_text or "overloaded" in error_text or "rate limit" in error_text or "429" in error_text:
+        return "The AI coach is very busy right now. Please wait a minute and try again."
+    elif "connection" in error_text:
+        return "Couldn't reach the analysis server. Please check your connection and try again."
+    else:
+        return "Something went wrong on our end. Please try again in a few minutes."
+
+
 @app.route("/upload-ballet", methods=["POST"])
 def upload_ballet():
     print(
@@ -579,103 +600,117 @@ def upload_ballet():
         f"content_type={request.content_type}, content_length={request.content_length}",
         flush=True,
     )
-    tmp_path = None
 
-    try:
-        # Extract form parameters
-        username     = (request.form.get("username")     or "anonymous").strip()
-        device_id    = (request.form.get("device_id")    or username).strip()
-        skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
-        health_specs = (request.form.get("health_specs") or "").strip()
+    # Extract form parameters + validate video BEFORE we start streaming a
+    # response, so a bad request still gets a normal, immediate JSON 400 —
+    # streaming only starts once we know there's real work to do.
+    username     = (request.form.get("username")     or "anonymous").strip()
+    device_id    = (request.form.get("device_id")    or username).strip()
+    skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
+    health_specs = (request.form.get("health_specs") or "").strip()
 
-        # Validate video file
-        if "video" not in request.files:
-            print(
-                f"[400] /upload-ballet rejected: missing 'video' field; "
-                f"form_fields={list(request.form.keys())}, "
-                f"file_fields={list(request.files.keys())}, "
-                f"content_type={request.content_type}",
-                flush=True,
-            )
-            return jsonify({"error": "No video file provided. Include a 'video' field in the multipart form."}), 400
-
-        video_file = request.files["video"]
-        if not video_file or video_file.filename == "":
-            print(
-                f"[400] /upload-ballet rejected: empty video file; "
-                f"filename={getattr(video_file, 'filename', None)!r}, "
-                f"form_fields={list(request.form.keys())}, "
-                f"file_fields={list(request.files.keys())}",
-                flush=True,
-            )
-            return jsonify({"error": "Empty video file received."}), 400
-
-        # Save to a temp file
-        suffix   = os.path.splitext(video_file.filename or ".mp4")[1] or ".mp4"
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-        os.close(tmp_fd)
-
-        video_file.save(tmp_path)
-
-        # Load history and ballet rules
-        history_db   = load_history_db()
-        history_data = get_user_history_text(history_db, device_id)
-        ballet_rules = load_ballet_rules()
-
-        # Process video with MediaPipe
-        frames_data, fps, duration_s = process_video(tmp_path)
-
-        if not frames_data:
-            return jsonify({
-                "corrections": (
-                    "No pose was detected in your video. Please ensure:\n"
-                    "• The dancer's body (hips to head) is clearly visible throughout.\n"
-                    "• The room is well-lit with no strong backlighting.\n"
-                    "• You are wearing form-fitting dancewear (leotard and tights).\n\n"
-                    "Please re-upload with these conditions corrected."
-                )
-            })
-
-        timeline_text = build_timeline_summary(frames_data, duration_s)
-
-        # Step 1: Gemini data filter
-        gemini_summary = run_gemini_filter(timeline_text)
-
-        # Step 2: Claude coaching critique
-        critique = run_claude_coaching(
-            gemini_summary    = gemini_summary,
-            username          = username,
-            skill_level       = skill_level,
-            health_specs      = health_specs,
-            history_data      = history_data,
-            ballet_rules_text = ballet_rules,
+    if "video" not in request.files:
+        print(
+            f"[400] /upload-ballet rejected: missing 'video' field; "
+            f"form_fields={list(request.form.keys())}, "
+            f"file_fields={list(request.files.keys())}, "
+            f"content_type={request.content_type}",
+            flush=True,
         )
+        return jsonify({"error": "No video file provided. Include a 'video' field in the multipart form."}), 400
 
-        # Persist to history
-        save_user_critique(history_db, device_id, username, critique, skill_level, health_specs)
-        save_history_db(history_db)
+    video_file = request.files["video"]
+    if not video_file or video_file.filename == "":
+        print(
+            f"[400] /upload-ballet rejected: empty video file; "
+            f"filename={getattr(video_file, 'filename', None)!r}, "
+            f"form_fields={list(request.form.keys())}, "
+            f"file_fields={list(request.files.keys())}",
+            flush=True,
+        )
+        return jsonify({"error": "Empty video file received."}), 400
 
-        return jsonify({"corrections": critique})
+    suffix   = os.path.splitext(video_file.filename or ".mp4")[1] or ".mp4"
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(tmp_fd)
+    video_file.save(tmp_path)
 
-    except Exception as exc:
-        print(f"[500] /upload-ballet failed: {exc!r}", flush=True)
-        traceback.print_exc()
+    def generate():
+        """
+        Streams one JSON object per line as each real backend stage starts/
+        finishes, so the frontend can show the dancer what's ACTUALLY
+        happening instead of a canned timer animation. Always ends with
+        exactly one line carrying either "corrections" or "error".
+        """
+        try:
+            yield json.dumps({"stage": "video_processing"}) + "\n"
 
-        error_text = str(exc).lower()
-        if "timeout" in error_text or "timed out" in error_text:
-            friendly = "This is taking longer than expected. Please try again in a moment."
-        elif "503" in error_text or "unavailable" in error_text or "overloaded" in error_text or "rate limit" in error_text or "429" in error_text:
-            friendly = "The AI coach is very busy right now. Please wait a minute and try again."
-        elif "connection" in error_text:
-            friendly = "Couldn't reach the analysis server. Please check your connection and try again."
-        else:
-            friendly = "Something went wrong on our end. Please try again in a few minutes."
+            history_db   = load_history_db()
+            history_data = get_user_history_text(history_db, device_id)
+            ballet_rules = load_ballet_rules()
 
-        return jsonify({"error": friendly}), 500
+            frames_data, fps, duration_s = process_video(tmp_path)
 
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            if not frames_data:
+                yield json.dumps({
+                    "stage": "done",
+                    "corrections": (
+                        "No pose was detected in your video. Please ensure:\n"
+                        "• The dancer's body (hips to head) is clearly visible throughout.\n"
+                        "• The room is well-lit with no strong backlighting.\n"
+                        "• You are wearing form-fitting dancewear (leotard and tights).\n\n"
+                        "Please re-upload with these conditions corrected."
+                    )
+                }) + "\n"
+                return
+
+            timeline_text = build_timeline_summary(frames_data, duration_s)
+
+            yield json.dumps({"stage": "gemini_analysis"}) + "\n"
+
+            # Step 1: Gemini data filter — if it's down/overloaded after all
+            # retries, don't kill the whole request. Fall back to handing
+            # Claude the raw MediaPipe timeline directly and having it do
+            # the filtering itself, under the same evidence rules.
+            used_fallback = False
+            try:
+                gemini_summary = run_gemini_filter(timeline_text)
+            except Exception as gemini_exc:
+                print(f"[WARN] Gemini unavailable after all retries, falling back to raw data for Claude: {gemini_exc!r}", flush=True)
+                gemini_summary = timeline_text
+                used_fallback  = True
+                yield json.dumps({"stage": "gemini_fallback"}) + "\n"
+
+            yield json.dumps({"stage": "claude_coaching"}) + "\n"
+
+            # Step 2: Claude coaching critique
+            critique = run_claude_coaching(
+                gemini_summary    = gemini_summary,
+                username          = username,
+                skill_level       = skill_level,
+                health_specs      = health_specs,
+                history_data      = history_data,
+                ballet_rules_text = ballet_rules,
+                used_fallback     = used_fallback,
+            )
+
+            yield json.dumps({"stage": "saving"}) + "\n"
+
+            save_user_critique(history_db, device_id, username, critique, skill_level, health_specs)
+            save_history_db(history_db)
+
+            yield json.dumps({"stage": "done", "corrections": critique}) + "\n"
+
+        except Exception as exc:
+            print(f"[500] /upload-ballet failed: {exc!r}", flush=True)
+            traceback.print_exc()
+            yield json.dumps({"stage": "done", "error": _friendly_error_text(exc)}) + "\n"
+
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
 
 
 @app.route("/ping", methods=["GET"])
