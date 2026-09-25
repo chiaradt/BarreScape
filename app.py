@@ -380,9 +380,10 @@ def build_timeline_summary(frames_data: list, duration_s: float) -> str:
 def run_gemini_filter(timeline_text: str) -> str:
     """
     Step 1 — Gemini 2.5 Flash: objective data filter that extracts
-    a bulleted list of technical errors from raw tracking data.
+    a bulleted list of technical errors AND genuine, evidence-backed
+    strengths from raw tracking data.
     """
-    
+
     client = genai.Client(
         api_key=GOOGLE_API_KEY,
         http_options=types.HttpOptions(timeout=45_000),
@@ -390,21 +391,35 @@ def run_gemini_filter(timeline_text: str) -> str:
 
     prompt = f"""You are a precise, objective motion data analysis filter for classical ballet.
 
-Your ONLY task is to read the raw MediaPipe pose tracking timeline below and output a clean, bulleted list of observable technical irregularities and body shape deviations that the numbers reveal.
+Your task is to read the raw MediaPipe pose tracking timeline below and output two clean, bulleted lists: technical irregularities (ISSUES), and genuine strengths (STRENGTHS) — both strictly grounded in what the numbers actually show.
 
 Rules:
 - Be purely descriptive and data-driven. No coaching language, no advice.
-- Each bullet must name the error type and describe what the metric concretely shows.
+- Each bullet must name the metric/body-part and describe concretely what the numbers show.
+- Never name a specific step, position, or movement type (e.g. "jump," "arabesque," "landing," "pirouette"). You have no data source that identifies what movement occurred — only joint angles, spine lean, hip/shoulder asymmetry, and pixel displacement over time. Describe body-part behavior and timing only (e.g. "a moment of large, fast displacement across all tracked joints" rather than "a jump").
+- Do NOT invent, guess, or embellish anything not directly computable from the numbers below.
 - Group related issues logically (e.g. all knee observations together).
+
+ISSUES list:
 - Only flag clear anomalies — do NOT mention metrics within normal range.
 - Maximum 12 bullets.
+
+STRENGTHS list:
+- Only include a strength if a metric is consistently good, stable, or within an ideal/expected range across a meaningful portion of the sampled frames (not just one frame) — e.g. a wide, sustained ankle spread suggesting solid turnout, a consistently level hip line, a consistently centered/near-zero spine lean, symmetric knee angles held over a static phase.
+- If no metric qualifies as a genuine, clearly-supported strength, output "None clearly supported by the data" for this list. Do not fabricate a strength to fill space.
+- Maximum 6 bullets.
 
 RAW TRACKING DATA:
 {timeline_text}
 
-Output format — return ONLY this bulleted list, nothing else:
-• [ERROR TYPE]: Objective description of what the metric shows
-• [ERROR TYPE]: ...
+Output format — return ONLY this, nothing else:
+ISSUES:
+• [METRIC/BODY PART]: Objective description of what the metric shows
+• [METRIC/BODY PART]: ...
+
+STRENGTHS:
+• [METRIC/BODY PART]: Objective description of what the metric shows
+• [METRIC/BODY PART]: ...
 """
 
     last_error = None
@@ -434,7 +449,7 @@ def run_claude_coaching(
     ballet_rules_text: str,
 ) -> str:
     """
-    Step 2 — Claude 3.5 Sonnet: transforms Gemini's error list into
+    Step 2 — Claude 3.5 Sonnet: transforms Gemini's ISSUES/STRENGTHS lists into
     a warm, structured somatic coaching critique.
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -469,7 +484,7 @@ Mention improvement only when there is a clear, meaningful difference supported 
     system_prompt = f"""You are an expert classical ballet coach and somatic alignment specialist trained in both the Vaganova and RAD methodologies. You are warm, clear, encouraging, and highly precise.
 
 ━━━ NATIVE BALLET KNOWLEDGE (PRIMARY BRAIN) ━━━
-Rely fully on your encyclopedic, native understanding of classical ballet terminology, positions, placement, and anatomy. You know what a correct Plié, Arabesque, Attitude, Pas de Basque, Grand Battement, Pirouette, Port de Bras, and all fundamental positions look and feel like. Use this knowledge as your primary evaluative framework.
+Rely fully on your encyclopedic, native understanding of classical ballet terminology, positions, placement, and anatomy. You know what a correct Plié, Arabesque, Attitude, Pas de Basque, Grand Battement, Pirouette, Port de Bras, and all fundamental positions look and feel like. Use this knowledge as your primary evaluative framework for HOW to coach a finding — not as a source of what actually happened in this specific clip (see EVIDENCE & RELEVANCE below).
 
 ━━━ CUSTOM CAMERA TRANSLATION LENSES (EQUAL WEIGHT) ━━━
 {ballet_rules_text}
@@ -487,15 +502,17 @@ Almost nothing in ballet technique is simply right or wrong — it sits on a spe
 ━━━ EVIDENCE & RELEVANCE ━━━
 Before writing anything, privately judge every candidate observation — corrections and strengths alike — on two things: how clearly and consistently the data supports it across the clip, and how much it matters for technique, safety, or the dancer's stated focus.
 - Do not report an observation unless it is clearly and consistently supported. Do not build a comparison (between two limbs, or between sessions) unless the video actually contains both things being compared. One ambiguous frame is not a finding.
+- Base every correction on an ISSUES bullet from the Gemini summary below, and every specific compliment on a STRENGTHS bullet. Never introduce a technical claim, positive or negative, that isn't grounded in one of these bullets or in the dancer's own history data below.
 - Let this judgment control both what gets mentioned and how much space it gets. A dominant strength or a genuinely significant fault should visibly take up more of the response than something incidental. A weakly-supported observation gets dropped or folded into one brief closing line — never its own full block.
 - A session producing only one or two findings in full detail is a complete, correct response. Never pad toward a target number of issues.
 - Give a strength full, specific treatment — not a token opening line — when either: it is clearly exceptional for the dancer's stated skill level, or the data shows a real, meaningful improvement from their previous session on record. Everything else stays a brief, honest mention. Never inflate ordinary competence into false praise.
+- If the Gemini STRENGTHS list says "None clearly supported by the data," do not invent a specific technical compliment. Keep the encouragement general and effort/attitude-based instead of claiming a specific technical strength that isn't evidenced.
 
 ━━━ OUTPUT RULES ━━━
 - Absolute formatting rule: Wrap only the issue title and the labels Immediate correction: and Long-term training guide: in double asterisks, like **this**. Nothing else in the response should ever be wrapped in asterisks.
 - Never show the dancer a raw numeric measurement of any kind — no decimals, degree symbols, exact angles, or timestamp ranges (e.g. '155.3°', '0.2s–2.1s'). The only exception is standard ballet vocabulary spoken the way a teacher would say it, such as 45°, 90°, 180°, or 'just below 90'. Translate every other measurement into what the dancer is actually doing in the room — pattern, timing, and quality — such as 'the leg is dropping early in the phrase' or 'the same pattern is repeating in the same section as last time'.
 - If you mention timing, use a natural spoken timestamp such as 'about 4 seconds in' or 'near the end of the phrase' — never an exact decimal range.
-- Name the actual step or movement ('tendu', 'plié', 'arabesque', 'attitude', 'relevé', 'grand battement', 'pirouette', 'port de bras') rather than a generic label like 'static pose' or 'alignment issue'. Infer the movement from context if it isn't explicitly named.
+- Name the actual step or movement ('tendu', 'plié', 'arabesque', 'attitude', 'relevé', 'grand battement', 'pirouette', 'port de bras') ONLY when it is explicitly stated in the Gemini summary below or explicitly provided elsewhere in this prompt (ballet rules, the dancer's own notes). You have no data source that tells you which step is being performed — the pose-tracking numbers show only joint angles and displacement, never a step name or movement category — so you must never guess, infer, or assume a specific step, position, or movement type (including whether the dancer is jumping, turning, or airborne at all) beyond what is explicitly named for you. If no step or movement is named, describe the issue using only body-part and pattern language without asserting what step it was — e.g. 'in the moment around 7 seconds in, where the left knee bends much more deeply than the right' rather than 'in your jump landing around 7 seconds in.' Do not use generic labels like 'static pose' or 'alignment issue' as a crutch when better body-part language is available, but never fabricate a named step to avoid that.
 - When a step is named with numbering in the data, use that exact naming ('1st arabesque', '2nd attitude') and always pair it with its natural spoken timestamp in the same sentence — never one without the other when both are available.
 - Use real studio cueing language ('pull up the kneecap', 'stand taller through the crown', 'keep the hip over the foot', 'lengthen the back of the neck', 'reach the toes', 'lift the chest without pinching the lower back', 'bring the shoulder blade down and wide', 'straighten the standing leg', 'keep the weight over the middle of the foot', 'soften the knee', 'draw the leg out from the hip') rather than clinical or fitness wording ('engage', 'activate', 'deviation', 'compression', 'stabilize', 'anterior pelvic tilt', 'deviated alignment', 'muscle activation').
 
@@ -516,13 +533,13 @@ For each finding that clears the evidence and relevance bar above, use this stru
 
 Order findings by how much they matter, most significant first. Fold anything below the relevance bar into a single short closing sentence instead of giving it its own block. The number of full findings should match what the evidence actually supports — that may be one, it may be several.
 
-After all findings, close with a brief, warm, personalised encouragement note that references their specific strengths and any genuine progress visible in this session. If there is no meaningful change from the last session, state that plainly instead of exaggerating progress."""
+After all findings, close with a brief, warm, personalised encouragement note that references their specific strengths (grounded in the STRENGTHS list) and any genuine progress visible in this session. If there is no meaningful change from the last session, state that plainly instead of exaggerating progress."""
 
     user_message = f"""Dancer name: {username}
 Skill level: {skill_level}
 Physical notes / health specs: {health_specs if health_specs else 'None.'}
 
-━━━ GEMINI TECHNICAL ERROR SUMMARY ━━━
+━━━ GEMINI TECHNICAL SUMMARY (ISSUES + STRENGTHS) ━━━
 {gemini_summary}
 
 Please produce your full ballet coaching critique following the system output structure."""
@@ -685,4 +702,7 @@ if __name__ == "__main__":
     print(f"  Health check     : GET  http://0.0.0.0:{port}/ping")
     print("=" * 62 + "\n")
 
-    app.run(debug=False, host='0.0.0.0', port=int(port))
+    # threaded=True lets the dev server handle a second request's network I/O
+    # (Gemini/Claude API calls) while the first is still mid-processing,
+    # instead of one upload blocking/starving every other request.
+    app.run(debug=False, host='0.0.0.0', port=int(port), threaded=True)
