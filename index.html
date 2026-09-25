@@ -404,6 +404,18 @@
     ];
 
     let statusInterval = null;
+    function getDeviceId() {
+  try {
+    var id = localStorage.getItem("barrescape_device_id");
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem("barrescape_device_id", id);
+    }
+    return id;
+  } catch (e) {
+    return "no-storage-" + Math.random().toString(36).slice(2);
+  }
+}
 
     function setLoading(active) {
       const btn       = document.getElementById("submitBtn");
@@ -472,6 +484,7 @@
       // ── Build FormData ──
       var formData = new FormData();
       formData.append("username",    username);
+      formData.append("device_id", getDeviceId());
       formData.append("skill_level", skillLevel);
       formData.append("health_specs", healthSpecs);
       formData.append("video",       videoFile);

@@ -8,6 +8,7 @@ import os
 import json
 import math
 import tempfile
+import time
 import datetime
 import traceback
 import urllib.request
@@ -20,6 +21,7 @@ from mediapipe.tasks.python import vision as mp_vision
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from google import genai
+from google.genai import types
 import anthropic
 
 # ---------------------------------------------------------------------------
@@ -88,23 +90,24 @@ def save_history_db(db: dict) -> None:
         json.dump(db, f, indent=2, ensure_ascii=False)
 
 
-def get_user_history_text(db: dict, username: str) -> str:
+def get_user_history_text(db: dict, device_id: str) -> str:
     """Return the text of the user's most recent critique, or empty string."""
-    entries = db.get(username, [])
+    entries = db.get(device_id, [])
     if entries:
         return entries[-1].get("critique", "")
     return ""
 
 
-def save_user_critique(db: dict, username: str, critique: str,
+def save_user_critique(db: dict, device_id: str, display_name: str, critique: str,
                         skill_level: str, health_specs: str) -> None:
-    if username not in db:
-        db[username] = []
-    db[username].append({
-        "date":        datetime.datetime.now().isoformat(timespec="seconds"),
-        "skill_level": skill_level,
+    if device_id not in db:
+        db[device_id] = []
+    db[device_id].append({
+        "date":         datetime.datetime.now().isoformat(timespec="seconds"),
+        "display_name": display_name,
+        "skill_level":  skill_level,
         "health_specs": health_specs,
-        "critique":    critique,
+        "critique":     critique,
     })
 
 
@@ -379,9 +382,11 @@ def run_gemini_filter(timeline_text: str) -> str:
     Step 1 — Gemini 2.5 Flash: objective data filter that extracts
     a bulleted list of technical errors from raw tracking data.
     """
-    key = GOOGLE_API_KEY or ""
-    print(f"[DEBUG] GOOGLE_API_KEY used: first12={key[:12]} | last4={key[-4:]} | len={len(key)}")
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    
+    client = genai.Client(
+        api_key=GOOGLE_API_KEY,
+        http_options=types.HttpOptions(timeout=45_000),
+    )
 
     prompt = f"""You are a precise, objective motion data analysis filter for classical ballet.
 
@@ -402,11 +407,22 @@ Output format — return ONLY this bulleted list, nothing else:
 • [ERROR TYPE]: ...
 """
 
-    response = client.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=prompt,
-    )
-    return response.text.strip()
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.5-flash",
+                contents=prompt,
+            )
+            summary_text = response.text.strip()
+            print(f"[DEBUG] Gemini raw summary:\n{summary_text}\n", flush=True)
+            return summary_text
+        except Exception as exc:
+            last_error = exc
+            print(f"[WARN] Gemini call failed (attempt {attempt + 1}/3): {exc!r}", flush=True)
+            if attempt < 2:
+                time.sleep(2)
+    raise last_error
 
 
 def run_claude_coaching(
@@ -422,6 +438,33 @@ def run_claude_coaching(
     a warm, structured somatic coaching critique.
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    if health_specs:
+        physical_section = f"""Dancer health/physical notes: {health_specs}
+Skill level: {skill_level}
+
+Interpret the health_specs input as two different categories:
+1. Physical limitations, injuries, or structural restrictions to account for compassionately and safely.
+2. Specific technique focus areas the dancer wants extra attention on, such as 'please focus on my turnout', 'I am working on my arabesque line', 'I want more port de bras', or similar direct requests.
+
+For category 1: For beginners and intermediates — DO NOT penalize natural physical limitations such as:
+- Tight ankles limiting foot arch or pointed-toe depth
+- Limited hamstring flexibility restricting extension height
+- Naturally reduced turnout from hip socket structure
+- Restricted spinal mobility
+
+Acknowledge these restrictions compassionately. Adjust all alignment checks to prioritise absolute physical safety first. If a restriction is structural or injury-related, never frame it as a careless mistake.
+
+For category 2: If the dancer explicitly requests a technique focus area, give that area priority in the critique. When a focus area is mentioned, expand on relevant findings within that area, explain how it is appearing in the movement, and give practical correction cues and training guidance that directly serve that goal. If other issues are present, still address them, but make the dancer's requested focus area a clear emphasis in the feedback and in the coaching priorities."""
+    else:
+        physical_section = f"Skill level: {skill_level}. No physical notes or focus areas were provided — evaluate technique normally for this skill level, without assuming any restriction."
+
+    if history_data:
+        history_section = f"""Previous session critique for this dancer:
+{history_data}
+
+Mention improvement only when there is a clear, meaningful difference supported by the data. If there is no meaningful change, say so plainly rather than praising a false improvement."""
+    else:
+        history_section = "This is the dancer's first session on record — no historical comparison available, so do not reference past progress."
 
     system_prompt = f"""You are an expert classical ballet coach and somatic alignment specialist trained in both the Vaganova and RAD methodologies. You are warm, clear, encouraging, and highly precise.
 
@@ -438,52 +481,42 @@ Treat these as equal-weight companion tools to help you decode raw screen metric
 - Write as a supportive, experienced studio teacher would speak.
 - Default to authentic ballet studio cueing language used by real teachers in class. Translate any clinical, biomechanical, or fitness phrasing into how a teacher would actually say it in the room.
 
+━━━ NUANCE ━━━
+Almost nothing in ballet technique is simply right or wrong — it sits on a spectrum, and the correct read depends on context: the dancer's skill level, their individual flexibility and anatomy, and how extreme the position is. Some hip movement is a normal, expected part of a very high extension — the question is degree, not presence. Never present a normal, expected trade-off as a flaw, and never flatten a genuinely significant fault into something minor just because a milder version of it can sometimes be normal. Judge each observation on its own evidence and severity, not against a fixed rule that ignores context.
+
+━━━ EVIDENCE & RELEVANCE ━━━
+Before writing anything, privately judge every candidate observation — corrections and strengths alike — on two things: how clearly and consistently the data supports it across the clip, and how much it matters for technique, safety, or the dancer's stated focus.
+- Do not report an observation unless it is clearly and consistently supported. Do not build a comparison (between two limbs, or between sessions) unless the video actually contains both things being compared. One ambiguous frame is not a finding.
+- Let this judgment control both what gets mentioned and how much space it gets. A dominant strength or a genuinely significant fault should visibly take up more of the response than something incidental. A weakly-supported observation gets dropped or folded into one brief closing line — never its own full block.
+- A session producing only one or two findings in full detail is a complete, correct response. Never pad toward a target number of issues.
+- Give a strength full, specific treatment — not a token opening line — when either: it is clearly exceptional for the dancer's stated skill level, or the data shows a real, meaningful improvement from their previous session on record. Everything else stays a brief, honest mention. Never inflate ordinary competence into false praise.
+
 ━━━ OUTPUT RULES ━━━
 - Absolute formatting rule: Wrap only the issue title and the labels Immediate correction: and Long-term training guide: in double asterisks, like **this**. Nothing else in the response should ever be wrapped in asterisks.
-- Absolute ban on numeric angle values in dancer-facing text: decimals, degree symbols, exact measured angles, and any specific numeric angle values must never appear in the text shown to the dancer. This includes values such as '155.3°', '132.6°', '90.4°', '0.2s-2.1s', or other raw angle/measurement numbers. The only exception is standard ballet extension language spoken as real ballet vocabulary, such as 45°, 90°, 180°, or phrases like 'just below 90' or 'close to 90'. All other angle information is internal reasoning only and must be translated into qualitative studio-language descriptions.
-- Translate internal angle calculations into coachable language. Instead of giving raw numbers, describe what the dancer is actually doing in the room in terms of pattern, timing, and quality: 'your right knee still isn't finishing its straighten', 'the leg is dropping early in the phrase', 'the hip is collapsing as the turn begins', 'the same pattern is repeating in the same section as last time', 'the chest is drifting forward before the leg opens', 'the back leg is losing the line instead of staying long and lifted'. Describe patterns and consistency compared with history, not number-to-number comparisons.
-- If you need to mention timing in a video, use natural spoken timestamps such as 'about 4 seconds in' or 'near the end of the phrase', not exact decimal ranges. Round to natural spoken language and keep the focus on where in the movement to look, not on raw numeric measurements.
-- Name the actual step or movement in your coaching language, such as 'tendu', 'plié', 'arabesque', 'attitude', 'relevé', 'grand battement', 'pirouette', or 'port de bras'. Do not use generic labels like 'static pose', 'position', or 'alignment issue' when the context clearly indicates a specific movement. Infer the movement from context if it is not explicitly named.
-- Use teacher-like cues, not generic fitness or anatomy phrases. Prefer real studio language such as 'pull up the kneecap', 'stand taller through the crown', 'keep the hip over the foot', 'lengthen the back of the neck', 'reach the toes', 'lift the chest without pinching the lower back', 'bring the shoulder blade down and wide', 'straighten the standing leg', 'keep the weight over the middle of the foot', 'soften the knee', and 'draw the leg out from the hip'. Avoid clinical or fitness wording such as 'engage', 'activate', 'deviation', 'compression', 'stabilize', 'anterior pelvic tilt', 'deviated alignment', 'muscle activation', or other generic exercise-language phrasing.
-- When the Gemini summary names a specific step or position with numbering, use that exact movement naming in the critique and refer to it as '1st arabesque', '2nd attitude', or whichever label appears. Do not collapse the feedback back into generic timestamps alone when a numbered step label is available. Always pair the named/numbered step together with its natural spoken timestamp in the same sentence, e.g. 'in your 1st arabesque, around 4 seconds in' — never state the step name alone without also giving its approximate timing, and never give a timestamp alone without naming the step if a name is available.
-- Be honest about progress. Only call out improvement when the data shows a genuine, meaningful difference from the previous session. If the metrics are nearly identical to last time, say that plainly and do not fabricate praise.
+- Never show the dancer a raw numeric measurement of any kind — no decimals, degree symbols, exact angles, or timestamp ranges (e.g. '155.3°', '0.2s–2.1s'). The only exception is standard ballet vocabulary spoken the way a teacher would say it, such as 45°, 90°, 180°, or 'just below 90'. Translate every other measurement into what the dancer is actually doing in the room — pattern, timing, and quality — such as 'the leg is dropping early in the phrase' or 'the same pattern is repeating in the same section as last time'.
+- If you mention timing, use a natural spoken timestamp such as 'about 4 seconds in' or 'near the end of the phrase' — never an exact decimal range.
+- Name the actual step or movement ('tendu', 'plié', 'arabesque', 'attitude', 'relevé', 'grand battement', 'pirouette', 'port de bras') rather than a generic label like 'static pose' or 'alignment issue'. Infer the movement from context if it isn't explicitly named.
+- When a step is named with numbering in the data, use that exact naming ('1st arabesque', '2nd attitude') and always pair it with its natural spoken timestamp in the same sentence — never one without the other when both are available.
+- Use real studio cueing language ('pull up the kneecap', 'stand taller through the crown', 'keep the hip over the foot', 'lengthen the back of the neck', 'reach the toes', 'lift the chest without pinching the lower back', 'bring the shoulder blade down and wide', 'straighten the standing leg', 'keep the weight over the middle of the foot', 'soften the knee', 'draw the leg out from the hip') rather than clinical or fitness wording ('engage', 'activate', 'deviation', 'compression', 'stabilize', 'anterior pelvic tilt', 'deviated alignment', 'muscle activation').
 
 ━━━ PHYSICAL CAPABILITY COMPASSION RULE ━━━
-Dancer health/physical notes: {health_specs if health_specs else 'None provided.'}
-Skill level: {skill_level}
-
-Interpret the health_specs input as two different categories:
-1. Physical limitations, injuries, or structural restrictions to account for compassionately and safely.
-2. Specific technique focus areas the dancer wants extra attention on, such as 'please focus on my turnout', 'I am working on my arabesque line', 'I want more port de bras', or similar direct requests.
-
-For category 1: For beginners and intermediates — DO NOT penalize natural physical limitations such as:
-- Tight ankles limiting foot arch or pointed-toe depth
-- Limited hamstring flexibility restricting extension height
-- Naturally reduced turnout from hip socket structure
-- Restricted spinal mobility
-
-Acknowledge these restrictions compassionately. Adjust all alignment checks to prioritise absolute physical safety first. If a restriction is structural or injury-related, never frame it as a careless mistake.
-
-For category 2: If the dancer explicitly requests a technique focus area, give that area priority in the critique. When a focus area is mentioned, expand on relevant findings within that area, explain how it is appearing in the movement, and give practical correction cues and training guidance that directly serve that goal. If other issues are present, still address them, but make the dancer's requested focus area a clear emphasis in the feedback and in the coaching priorities.
+{physical_section}
 
 ━━━ PAST HISTORY ACKNOWLEDGEMENT ━━━
-Previous session critique for this dancer:
-{history_data if history_data else "This is the dancer's first session on record — no historical comparison available."}
-
-If history exists: Mention improvement only when there is a clear, meaningful difference supported by the data. If there is no meaningful change, say so plainly rather than praising a false improvement.
+{history_section}
 
 ━━━ OUTPUT STRUCTURE ━━━
-Begin with 1-2 short, warm sentences greeting the dancer by name and setting a positive tone before the first issue is listed.
+Begin with 1-2 short, warm sentences greeting the dancer by name and setting a positive tone.
 
-For each identified issue, use this structure:
+For each finding that clears the evidence and relevance bar above, use this structure:
 
 **[Issue Name — brief, plain English]**
 **Immediate correction:** A practical, muscle-engagement studio cue to safely adjust their posture right now, within their current physical capacity.
 **Long-term training guide:** A specific, safe 6-week progressive exercise or conditioning stretch to address the root cause. If the issue is structural or injury-related, explicitly ask whether they would like tailored modifications, and offer 1-2 safe low-impact variants appropriate for their current capacity.
 
-If more than four issues are detected, prioritise and discuss only the most significant ones in full detail. Briefly acknowledge any additional minor observations in one short closing sentence rather than giving each equal in-depth treatment. Focus on the issues that most affect technique, safety, and the dancer's stated focus area.
+Order findings by how much they matter, most significant first. Fold anything below the relevance bar into a single short closing sentence instead of giving it its own block. The number of full findings should match what the evidence actually supports — that may be one, it may be several.
 
-After all issues, close with a brief, warm, personalised encouragement note that references their specific strengths and any genuine progress visible in this session. If there is no meaningful change from the last session, state that plainly instead of exaggerating progress."""
+After all findings, close with a brief, warm, personalised encouragement note that references their specific strengths and any genuine progress visible in this session. If there is no meaningful change from the last session, state that plainly instead of exaggerating progress."""
 
     user_message = f"""Dancer name: {username}
 Skill level: {skill_level}
@@ -494,18 +527,29 @@ Physical notes / health specs: {health_specs if health_specs else 'None.'}
 
 Please produce your full ballet coaching critique following the system output structure."""
 
-    response = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=4096,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
-    )
-
-    text_parts = []
-    for block in response.content:
-        if getattr(block, "type", None) == "text":
-            text_parts.append(block.text)
-    return "".join(text_parts)
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+                timeout=45.0,
+            )
+            text_parts = []
+            for block in response.content:
+                if getattr(block, "type", None) == "text":
+                    text_parts.append(block.text)
+            critique_text = "".join(text_parts)
+            print(f"[DEBUG] Claude raw response:\n{critique_text}\n", flush=True)
+            return critique_text
+        except Exception as exc:
+            last_error = exc
+            print(f"[WARN] Claude call failed (attempt {attempt + 1}/3): {exc!r}", flush=True)
+            if attempt < 2:
+                time.sleep(2)
+    raise last_error
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +567,7 @@ def upload_ballet():
     try:
         # Extract form parameters
         username     = (request.form.get("username")     or "anonymous").strip()
+        device_id    = (request.form.get("device_id")    or username).strip()
         skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
         health_specs = (request.form.get("health_specs") or "").strip()
 
@@ -557,7 +602,7 @@ def upload_ballet():
 
         # Load history and ballet rules
         history_db   = load_history_db()
-        history_data = get_user_history_text(history_db, username)
+        history_data = get_user_history_text(history_db, device_id)
         ballet_rules = load_ballet_rules()
 
         # Process video with MediaPipe
@@ -590,7 +635,7 @@ def upload_ballet():
         )
 
         # Persist to history
-        save_user_critique(history_db, username, critique, skill_level, health_specs)
+        save_user_critique(history_db, device_id, username, critique, skill_level, health_specs)
         save_history_db(history_db)
 
         return jsonify({"corrections": critique})
@@ -598,7 +643,18 @@ def upload_ballet():
     except Exception as exc:
         print(f"[500] /upload-ballet failed: {exc!r}", flush=True)
         traceback.print_exc()
-        return jsonify({"error": f"Server error: {str(exc)}"}), 500
+
+        error_text = str(exc).lower()
+        if "timeout" in error_text or "timed out" in error_text:
+            friendly = "This is taking longer than expected. Please try again in a moment."
+        elif "503" in error_text or "unavailable" in error_text or "overloaded" in error_text or "rate limit" in error_text or "429" in error_text:
+            friendly = "The AI coach is very busy right now. Please wait a minute and try again."
+        elif "connection" in error_text:
+            friendly = "Couldn't reach the analysis server. Please check your connection and try again."
+        else:
+            friendly = "Something went wrong on our end. Please try again in a few minutes."
+
+        return jsonify({"error": friendly}), 500
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -618,8 +674,8 @@ if __name__ == "__main__":
     print("\n" + "=" * 62)
     print("  Ballet AI Technique Analysis Server  v1.0")
     print("=" * 62)
-    print(f"  Google API Key   : {'SET' if GOOGLE_API_KEY   != 'YOUR_GOOGLE_API_KEY_HERE'   else 'NOT SET — add to GOOGLE_API_KEY env var'}")
-    print(f"  Anthropic Key    : {'SET' if ANTHROPIC_API_KEY != 'YOUR_ANTHROPIC_API_KEY_HERE' else 'NOT SET — add to ANTHROPIC_API_KEY env var'}")
+    print(f"  Google API Key   : {'SET' if GOOGLE_API_KEY  else 'NOT SET — add to GOOGLE_API_KEY env var'}")
+    print(f"  Anthropic Key    : {'SET' if ANTHROPIC_API_KEY else 'NOT SET — add to ANTHROPIC_API_KEY env var'}")
     print(f"  History DB       : {HISTORY_DB_PATH}")
     print(f"  Ballet Rules     : {BALLET_RULES_PATH} ({'found' if os.path.exists(BALLET_RULES_PATH) else 'not found — optional'})")
     print(f"  Pose Model       : {MODEL_PATH} ({'ready' if os.path.exists(MODEL_PATH) else 'will download on first request'})")
@@ -629,4 +685,4 @@ if __name__ == "__main__":
     print(f"  Health check     : GET  http://0.0.0.0:{port}/ping")
     print("=" * 62 + "\n")
 
-    app.run(debug=True, host='0.0.0.0', port=port)
+    app.run(debug=False, host='0.0.0.0', port=int(port))
