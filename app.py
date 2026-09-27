@@ -379,8 +379,9 @@ def build_timeline_summary(frames_data: list, duration_s: float) -> str:
 # ---------------------------------------------------------------------------
 def run_gemini_filter(timeline_text: str) -> str:
     """
-    Step 1 — Gemini 2.5 Flash: objective data filter that extracts
-    a bulleted list of technical errors AND genuine, evidence-backed
+    Step 1 — Gemini (tries a short list of current model names, see
+    MODEL_CANDIDATES below): objective data filter that extracts a
+    bulleted list of technical errors AND genuine, evidence-backed
     strengths from raw tracking data.
     """
 
@@ -422,21 +423,41 @@ STRENGTHS:
 • [METRIC/BODY PART]: ...
 """
 
+    # Google has renamed/deprecated this model twice in the course of testing
+    # this app (gemini-3.5-flash got overloaded, gemini-2.5-flash then got
+    # deprecated for new API keys). Rather than hardcode one name and break
+    # again next time Google reshuffles, try a short list of candidates.
+    # A "model not found" error skips immediately to the next candidate
+    # (retrying a dead model name wastes time); a transient error (503
+    # overload, timeout) gets a couple of retries on that same model first.
+    MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+
     last_error = None
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-            summary_text = response.text.strip()
-            print(f"[DEBUG] Gemini raw summary:\n{summary_text}\n", flush=True)
-            return summary_text
-        except Exception as exc:
-            last_error = exc
-            print(f"[WARN] Gemini call failed (attempt {attempt + 1}/3): {exc!r}", flush=True)
-            if attempt < 2:
-                time.sleep(2)
+    for model_name in MODEL_CANDIDATES:
+        retries_for_this_model = 2
+        for attempt in range(retries_for_this_model):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                summary_text = response.text.strip()
+                print(f"[DEBUG] Gemini raw summary (model={model_name}):\n{summary_text}\n", flush=True)
+                return summary_text
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc).lower()
+                is_model_missing = "404" in error_text or "not_found" in error_text or "not found" in error_text
+                print(
+                    f"[WARN] Gemini call failed (model={model_name}, attempt {attempt + 1}/{retries_for_this_model}): {exc!r}",
+                    flush=True,
+                )
+                if is_model_missing:
+                    # No point retrying a model name that doesn't exist —
+                    # move straight to the next candidate.
+                    break
+                if attempt < retries_for_this_model - 1:
+                    time.sleep(2)
     raise last_error
 
 
