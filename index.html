@@ -16,6 +16,7 @@
       color: #4D4444;
       padding: 40px 40px 80px;
       -webkit-font-smoothing: antialiased;
+      overflow: hidden;
     }
 
     /* ── Layout container ── */
@@ -229,6 +230,11 @@
       border: 1px solid #e2dede;
       border-radius: 12px;
       padding: 38px 34px;
+      /* Leaves room above this element when it's scrolled into view, so
+         the page's fixed-position header doesn't overlap the top of the
+         results (adjust this to match your header's actual rendered
+         height if it changes). */
+      scroll-margin-top: 120px;
     }
     .results-card {
       border-radius: 12px;
@@ -388,55 +394,51 @@
       <div id="correctionDisplay"></div>
     </div>
 
-    <p class="footer-note">Powered by MediaPipe · Gemini 2.5 Flash · Claude 3.5 Sonnet</p>
+    <p class="footer-note">Powered by MediaPipe · Gemini 2.5 Flash · Claude Sonnet</p>
 
   </div><!-- /wrap -->
 
   <script>
-    // Status message rotation during processing
-    const STATUS_STEPS = [
-      "Uploading your video...",
-      "Running MediaPipe pose tracking...",
-      "Extracting joint angles and movement phases...",
-      "Analysing technique data with Gemini...",
-      "Generating coaching feedback with Claude...",
-      "Finalising your personalised critique..."
-    ];
+    // Maps real backend stages (sent by the server as it actually reaches
+    // each step) to what the dancer sees. No more fake timer cycling —
+    // this only changes when the server says it changed.
+    const STAGE_TEXT = {
+      video_processing: "Running MediaPipe pose tracking & extracting joint angles...",
+      gemini_analysis:  "Analysing technique data with Gemini...",
+      gemini_fallback:  "Gemini is busy — analysing the data directly instead...",
+      claude_coaching:  "Generating coaching feedback with Claude...",
+      saving:           "Finalising your personalised critique..."
+    };
 
-    let statusInterval = null;
     function getDeviceId() {
-  try {
-    var id = localStorage.getItem("barrescape_device_id");
-    if (!id) {
-      id = crypto.randomUUID();
-      localStorage.setItem("barrescape_device_id", id);
+      try {
+        var id = localStorage.getItem("barrescape_device_id");
+        if (!id) {
+          id = crypto.randomUUID();
+          localStorage.setItem("barrescape_device_id", id);
+        }
+        return id;
+      } catch (e) {
+        return "no-storage-" + Math.random().toString(36).slice(2);
+      }
     }
-    return id;
-  } catch (e) {
-    return "no-storage-" + Math.random().toString(36).slice(2);
-  }
-}
 
-    function setLoading(active) {
+    function setLoading(active, initialText) {
       const btn       = document.getElementById("submitBtn");
       const bar       = document.getElementById("statusBar");
       const statusTxt = document.getElementById("statusText");
 
+      btn.disabled = active;
       if (active) {
-        btn.disabled = true;
         bar.classList.add("visible");
-        statusTxt.textContent = STATUS_STEPS[0];
-        let stepIdx = 0;
-        statusInterval = setInterval(function () {
-          stepIdx = (stepIdx + 1) % STATUS_STEPS.length;
-          statusTxt.textContent = STATUS_STEPS[stepIdx];
-        }, 5500);
+        statusTxt.textContent = initialText || "Uploading your video...";
       } else {
-        btn.disabled = false;
         bar.classList.remove("visible");
-        clearInterval(statusInterval);
-        statusInterval = null;
       }
+    }
+
+    function setStatusText(text) {
+      document.getElementById("statusText").textContent = text;
     }
 
     function showResult(html, isError) {
@@ -490,7 +492,7 @@
       formData.append("video",       videoFile);
 
       // ── UI: enter loading state ──
-      setLoading(true);
+      setLoading(true, "Uploading your video...");
       document.getElementById("resultsCard").classList.remove("visible");
 
       try {
@@ -508,14 +510,60 @@
           throw new Error(errMsg);
         }
 
-        var data = await response.json();
+        if (!response.body) {
+          // Fallback for any environment that can't stream — read it whole.
+          var data = await response.json();
+          if (data.corrections) {
+            showResult(data.corrections, false);
+          } else if (data.error) {
+            showResult(data.error, true);
+          } else {
+            showResult("Unexpected response from server. Please try again.", true);
+          }
+          return;
+        }
 
-        if (data.corrections) {
-          showResult(data.corrections, false);
-        } else if (data.error) {
-          showResult("Server error: " + data.error, true);
-        } else {
-          showResult("Unexpected response from server. Please try again.", true);
+        // ── Read the real, live stage-by-stage stream from the server ──
+        var reader  = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer  = "";
+        var finished = false;
+
+        while (true) {
+          var chunk = await reader.read();
+          if (chunk.done) break;
+
+          buffer += decoder.decode(chunk.value, { stream: true });
+          var lines = buffer.split("\n");
+          buffer = lines.pop(); // keep last (possibly incomplete) line in buffer
+
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (!line) continue;
+
+            var msg;
+            try { msg = JSON.parse(line); } catch (_) { continue; }
+
+            if (msg.stage === "done") {
+              finished = true;
+              if (msg.corrections) {
+                showResult(msg.corrections, false);
+              } else if (msg.error) {
+                showResult(msg.error, true);
+              } else {
+                showResult("Unexpected response from server. Please try again.", true);
+              }
+            } else if (msg.stage && STAGE_TEXT[msg.stage]) {
+              setStatusText(STAGE_TEXT[msg.stage]);
+            }
+          }
+        }
+
+        if (!finished) {
+          showResult(
+            "The connection closed before a result came back. If you switched apps or the screen locked mid-upload, that can interrupt it — please keep this tab open and in the foreground, then try again.",
+            true
+          );
         }
 
       } catch (err) {

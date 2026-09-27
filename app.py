@@ -18,7 +18,7 @@ import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks_python
 from mediapipe.tasks.python import vision as mp_vision
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from google import genai
 from google.genai import types
@@ -52,6 +52,12 @@ POSE_MODEL_URL = (
 # Process every Nth frame for speed
 FRAME_SAMPLE_RATE    = 3
 STATIC_MOTION_THRESHOLD = 6.0   # avg pixel displacement — below this = static pose hold
+
+# How many actual video frames get sent to Gemini as images, on top of the
+# MediaPipe numeric timeline. Evenly spaced across the clip so Gemini sees
+# the shape of the whole movement, not just one instant.
+GEMINI_VISUAL_FRAME_COUNT = 10
+GEMINI_VISUAL_JPEG_QUALITY = 85
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -293,6 +299,54 @@ def process_video(video_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Visual frame sampling (for Gemini's vision input)
+# ---------------------------------------------------------------------------
+def extract_visual_frames(video_path: str, count: int = GEMINI_VISUAL_FRAME_COUNT):
+    """
+    Pull `count` evenly-spaced frames from the video as JPEG bytes, so Gemini
+    can actually SEE what step/position is being performed, whether the feet
+    are pointed, the quality of turnout, port de bras shape, and general
+    carriage/artistry — none of which exist anywhere in the MediaPipe number
+    table. Returns a list of (time_s, jpeg_bytes) tuples in chronological
+    order; empty list if the video can't be read.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    if total_frames <= 0:
+        cap.release()
+        return []
+
+    count = max(1, min(count, total_frames))
+    # Evenly spaced indices across the whole clip, inclusive of both ends.
+    if count == 1:
+        indices = [total_frames // 2]
+    else:
+        indices = [round(i * (total_frames - 1) / (count - 1)) for i in range(count)]
+
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        ok, buf = cv2.imencode(
+            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), GEMINI_VISUAL_JPEG_QUALITY]
+        )
+        if not ok:
+            continue
+        time_s = round(idx / fps, 2)
+        frames.append((time_s, buf.tobytes()))
+
+    cap.release()
+    return frames
+
+
+# ---------------------------------------------------------------------------
 # Timeline summary builder
 # ---------------------------------------------------------------------------
 def build_timeline_summary(frames_data: list, duration_s: float) -> str:
@@ -377,51 +431,115 @@ def build_timeline_summary(frames_data: list, duration_s: float) -> str:
 # ---------------------------------------------------------------------------
 # LLM Pipeline
 # ---------------------------------------------------------------------------
-def run_gemini_filter(timeline_text: str) -> str:
+def run_gemini_filter(timeline_text: str, visual_frames: list) -> str:
     """
-    Step 1 — Gemini 2.5 Flash: objective data filter that extracts
-    a bulleted list of technical errors from raw tracking data.
+    Step 1 — Gemini (tries a short list of current model names, see
+    MODEL_CANDIDATES below): fuses two independent evidence sources into one
+    clean, bulleted summary:
+
+      1. The MediaPipe numeric timeline (joint angles, spine lean, hip/
+         shoulder asymmetry, displacement over time) — precise, but blind to
+         anything that isn't a tracked skeletal point. It cannot tell you
+         what step is being danced, whether a foot is pointed, or how a
+         movement actually looks.
+      2. Actual sampled frames from the video — Gemini can SEE these, so it
+         is the only stage in this pipeline that can identify the step by
+         name, judge foot pointing/turnout/port de bras by eye, and note
+         carriage/artistry qualities. The numbers can't do any of that.
+
+    Output is a technical filter step (still no coaching language) — but it
+    is now allowed to report what it visually observes, clearly labelled
+    apart from the numeric findings, so the coaching step downstream knows
+    which claims are eyeballed vs. measured.
     """
-    
+
     client = genai.Client(
         api_key=GOOGLE_API_KEY,
         http_options=types.HttpOptions(timeout=45_000),
     )
 
-    prompt = f"""You are a precise, objective motion data analysis filter for classical ballet.
+    frame_time_list = ", ".join(f"{t:.1f}s" for t, _ in visual_frames) or "none available"
 
-Your ONLY task is to read the raw MediaPipe pose tracking timeline below and output a clean, bulleted list of observable technical irregularities and body shape deviations that the numbers reveal.
+    prompt = f"""You are a precise ballet motion analyst working from TWO evidence sources for the same clip. Treat them as separate evidence types and never blur them together.
 
-Rules:
-- Be purely descriptive and data-driven. No coaching language, no advice.
-- Each bullet must name the error type and describe what the metric concretely shows.
-- Group related issues logically (e.g. all knee observations together).
-- Only flag clear anomalies — do NOT mention metrics within normal range.
-- Maximum 12 bullets.
-
-RAW TRACKING DATA:
+SOURCE A — MediaPipe numeric tracking timeline (objective, but ONLY knows joint angles, spine lean, hip/shoulder asymmetry, and pixel displacement over time; it has no idea what step is being danced, whether feet are pointed, or how anything actually looks):
 {timeline_text}
 
-Output format — return ONLY this bulleted list, nothing else:
-• [ERROR TYPE]: Objective description of what the metric shows
-• [ERROR TYPE]: ...
+SOURCE B — {len(visual_frames)} actual frames sampled evenly across the clip, attached as images, at approximately: {frame_time_list}. This is the ONLY evidence source that can show you what step/position is being performed, whether feet are pointed or flexed, the quality of turnout, port de bras/arm shape, épaulement, and general carriage (stiff vs. fluid, pulled-up vs. collapsed, confident vs. tentative). Use your native ballet knowledge to read these frames the way a teacher watching class would.
+
+CAMERA-ANGLE HONESTY RULE (critical): Look at the frames and judge the actual camera angle for yourself.
+- If the shot is a strict side profile (one leg/side of the body largely hidden behind the other), you CANNOT reliably judge left-vs-right symmetry (which knee bends deeper, which hip is higher, which side of the torso leans) — that requires seeing both sides at once. In that case, do NOT report a left/right comparison finding, even if the numeric data suggests one — the numeric left/right labels themselves are unreliable from a profile view (pose models frequently mislabel which visible leg is "left" vs "right" from the side). Instead, describe what's visible in absolute terms (e.g. "the front leg" / "the back leg," "the leg closer to camera").
+- Only make a left/right symmetry claim when the frames actually show both sides of the body clearly (e.g. a front-facing or three-quarter angle).
+
+Output two things:
+
+1. STEP_IDENTIFIED: Name the step(s)/position(s) you can clearly identify from the frames, using correct classical ballet vocabulary (e.g. "fourth position plié," "grand battement devant," "à la seconde," "port de bras"), each paired with its approximate timestamp. If the frames show a hard scene/location cut (different room, different outfit, different day) partway through, say so explicitly and describe each segment separately — do not describe cuts as one continuous phrase. If you genuinely cannot identify a clear step, say "No specific step clearly identifiable" rather than guessing.
+
+2. ISSUES and STRENGTHS lists, each bullet tagged with its evidence source in brackets:
+   - [DATA] bullets: grounded strictly in Source A's numbers — metric/body-part behavior, no guessing beyond what the numbers show, no left/right claim if the camera-angle rule above rules it out.
+   - [VISUAL] bullets: grounded strictly in what you can actually see in Source B's frames — foot pointing/sickling, turnout quality, port de bras/arm lines, épaulement, posture (pulled up vs. sinking), stiffness vs. fluidity, facial/general artistry. Only report a visual quality if it's clearly visible and consistent across the relevant frames, not a guess from one ambiguous frame.
+
+Rules:
+- Be purely descriptive, no coaching language or advice — that happens in a later step.
+- Do NOT invent, guess, or embellish anything not directly supported by Source A's numbers or clearly visible in Source B's frames.
+- Group related bullets logically (e.g. all knee observations together, all foot/turnout observations together).
+
+ISSUES list: only flag clear anomalies — do not mention metrics/qualities that are within normal, acceptable range. Maximum 14 bullets total across [DATA] and [VISUAL].
+
+STRENGTHS list: only include a strength that is consistently good/stable across a meaningful portion of the clip (not one frame). If nothing qualifies, write "None clearly supported by the evidence." Maximum 6 bullets total.
+
+Output format — return ONLY this, nothing else:
+STEP_IDENTIFIED:
+[your step identification as described above]
+
+ISSUES:
+• [VISUAL or DATA] [METRIC/BODY PART]: description
+• ...
+
+STRENGTHS:
+• [VISUAL or DATA] [METRIC/BODY PART]: description
+• ...
 """
 
+    contents = [prompt]
+    for _t, jpeg_bytes in visual_frames:
+        contents.append(types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"))
+
+    # Google has renamed/deprecated this model twice in the course of testing
+    # this app (gemini-3.5-flash got overloaded, gemini-2.5-flash then got
+    # deprecated for new API keys). Rather than hardcode one name and break
+    # again next time Google reshuffles, try a short list of candidates.
+    # A "model not found" error skips immediately to the next candidate
+    # (retrying a dead model name wastes time); a transient error (503
+    # overload, timeout) gets a couple of retries on that same model first.
+    MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+
     last_error = None
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.5-flash",
-                contents=prompt,
-            )
-            summary_text = response.text.strip()
-            print(f"[DEBUG] Gemini raw summary:\n{summary_text}\n", flush=True)
-            return summary_text
-        except Exception as exc:
-            last_error = exc
-            print(f"[WARN] Gemini call failed (attempt {attempt + 1}/3): {exc!r}", flush=True)
-            if attempt < 2:
-                time.sleep(2)
+    for model_name in MODEL_CANDIDATES:
+        retries_for_this_model = 2
+        for attempt in range(retries_for_this_model):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                )
+                summary_text = response.text.strip()
+                print(f"[DEBUG] Gemini raw summary (model={model_name}):\n{summary_text}\n", flush=True)
+                return summary_text
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc).lower()
+                is_model_missing = "404" in error_text or "not_found" in error_text or "not found" in error_text
+                print(
+                    f"[WARN] Gemini call failed (model={model_name}, attempt {attempt + 1}/{retries_for_this_model}): {exc!r}",
+                    flush=True,
+                )
+                if is_model_missing:
+                    # No point retrying a model name that doesn't exist —
+                    # move straight to the next candidate.
+                    break
+                if attempt < retries_for_this_model - 1:
+                    time.sleep(2)
     raise last_error
 
 
@@ -432,9 +550,10 @@ def run_claude_coaching(
     health_specs:      str,
     history_data:      str,
     ballet_rules_text: str,
+    used_fallback:     bool = False,
 ) -> str:
     """
-    Step 2 — Claude 3.5 Sonnet: transforms Gemini's error list into
+    Step 2 — Claude 3.5 Sonnet: transforms Gemini's ISSUES/STRENGTHS lists into
     a warm, structured somatic coaching critique.
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -469,7 +588,7 @@ Mention improvement only when there is a clear, meaningful difference supported 
     system_prompt = f"""You are an expert classical ballet coach and somatic alignment specialist trained in both the Vaganova and RAD methodologies. You are warm, clear, encouraging, and highly precise.
 
 ━━━ NATIVE BALLET KNOWLEDGE (PRIMARY BRAIN) ━━━
-Rely fully on your encyclopedic, native understanding of classical ballet terminology, positions, placement, and anatomy. You know what a correct Plié, Arabesque, Attitude, Pas de Basque, Grand Battement, Pirouette, Port de Bras, and all fundamental positions look and feel like. Use this knowledge as your primary evaluative framework.
+Rely fully on your encyclopedic, native understanding of classical ballet terminology, positions, placement, and anatomy. You know what a correct Plié, Arabesque, Attitude, Pas de Basque, Grand Battement, Pirouette, Port de Bras, and all fundamental positions look and feel like. Use this knowledge as your primary evaluative framework for HOW to coach a finding — not as a source of what actually happened in this specific clip (see EVIDENCE & RELEVANCE below).
 
 ━━━ CUSTOM CAMERA TRANSLATION LENSES (EQUAL WEIGHT) ━━━
 {ballet_rules_text}
@@ -485,19 +604,25 @@ Treat these as equal-weight companion tools to help you decode raw screen metric
 Almost nothing in ballet technique is simply right or wrong — it sits on a spectrum, and the correct read depends on context: the dancer's skill level, their individual flexibility and anatomy, and how extreme the position is. Some hip movement is a normal, expected part of a very high extension — the question is degree, not presence. Never present a normal, expected trade-off as a flaw, and never flatten a genuinely significant fault into something minor just because a milder version of it can sometimes be normal. Judge each observation on its own evidence and severity, not against a fixed rule that ignores context.
 
 ━━━ EVIDENCE & RELEVANCE ━━━
-Before writing anything, privately judge every candidate observation — corrections and strengths alike — on two things: how clearly and consistently the data supports it across the clip, and how much it matters for technique, safety, or the dancer's stated focus.
+Before writing anything, privately judge every candidate observation — corrections and strengths alike — on two things: how clearly and consistently the evidence supports it across the clip, and how much it matters for technique, safety, or the dancer's stated focus.
 - Do not report an observation unless it is clearly and consistently supported. Do not build a comparison (between two limbs, or between sessions) unless the video actually contains both things being compared. One ambiguous frame is not a finding.
+- The Gemini summary below tags each bullet's evidence source: [DATA] = grounded in MediaPipe's numeric joint tracking; [VISUAL] = grounded in Gemini actually looking at sampled video frames. Both are legitimate, first-class evidence — a [VISUAL] finding about pointed feet, turnout, port de bras, épaulement, posture/carriage, or stiffness/fluidity deserves exactly the same weight and treatment as a [DATA] finding about joint angles. Do not silently drop or downgrade [VISUAL] findings just because they aren't numeric — the whole point of having them is that MediaPipe's numbers alone cannot see any of that, and dancers care about these qualities as much as raw alignment, often more.
+- Base every correction on an ISSUES bullet from the Gemini summary below, and every specific compliment on a STRENGTHS bullet. Never introduce a technical claim, positive or negative, that isn't grounded in one of these bullets or in the dancer's own history data below.
+- FALLBACK MODE: if the material below is marked as raw, unfiltered MediaPipe data rather than a Gemini summary (no STEP_IDENTIFIED field, no [DATA]/[VISUAL] tags), the filtering step didn't run and no video frames reached you either. In that case you must filter the raw numbers yourself, applying this exact same evidence bar, and the strict step-naming ban in OUTPUT RULES below applies without exception, since you have no visual confirmation of anything.
 - Let this judgment control both what gets mentioned and how much space it gets. A dominant strength or a genuinely significant fault should visibly take up more of the response than something incidental. A weakly-supported observation gets dropped or folded into one brief closing line — never its own full block.
 - A session producing only one or two findings in full detail is a complete, correct response. Never pad toward a target number of issues.
 - Give a strength full, specific treatment — not a token opening line — when either: it is clearly exceptional for the dancer's stated skill level, or the data shows a real, meaningful improvement from their previous session on record. Everything else stays a brief, honest mention. Never inflate ordinary competence into false praise.
+- If the Gemini STRENGTHS list says "None clearly supported by the evidence," do not invent a specific technical compliment. Keep the encouragement general and effort/attitude-based instead of claiming a specific technical strength that isn't evidenced.
 
 ━━━ OUTPUT RULES ━━━
 - Absolute formatting rule: Wrap only the issue title and the labels Immediate correction: and Long-term training guide: in double asterisks, like **this**. Nothing else in the response should ever be wrapped in asterisks.
 - Never show the dancer a raw numeric measurement of any kind — no decimals, degree symbols, exact angles, or timestamp ranges (e.g. '155.3°', '0.2s–2.1s'). The only exception is standard ballet vocabulary spoken the way a teacher would say it, such as 45°, 90°, 180°, or 'just below 90'. Translate every other measurement into what the dancer is actually doing in the room — pattern, timing, and quality — such as 'the leg is dropping early in the phrase' or 'the same pattern is repeating in the same section as last time'.
-- If you mention timing, use a natural spoken timestamp such as 'about 4 seconds in' or 'near the end of the phrase' — never an exact decimal range.
-- Name the actual step or movement ('tendu', 'plié', 'arabesque', 'attitude', 'relevé', 'grand battement', 'pirouette', 'port de bras') rather than a generic label like 'static pose' or 'alignment issue'. Infer the movement from context if it isn't explicitly named.
+- If you mention timing, always use a concrete, specific spoken timestamp such as 'about 4 seconds in' or 'right as you begin the plié, around 1 second in' — never an exact decimal range, and never a vague, unanchored label like 'the middle section,' 'the movement,' or 'during the hold' standing in on its own for a real timestamp or a real step name. If you don't have enough information to say when or what, say so plainly rather than reaching for a vague placeholder word.
+- Name the actual step or position (e.g. 'fourth position plié', 'tendu', 'arabesque', 'attitude', 'relevé', 'grand battement', 'à la seconde', 'pirouette', 'port de bras') whenever the Gemini summary's STEP_IDENTIFIED field names one, or a [VISUAL] bullet names one, or it is explicitly provided elsewhere in this prompt (ballet rules, the dancer's own notes). This is now expected, not optional — do not fall back to generic body-part-only language ('the leg extends,' 'during the hold') when a real step name is available to you; that vagueness is a defect, not a safe default. Only when STEP_IDENTIFIED explicitly says no step was clearly identifiable, or the material is raw fallback data, should you describe the issue using body-part and pattern language without asserting a step name — e.g. 'in the moment around 7 seconds in, where the front leg bends much more deeply than the back' rather than inventing a step you were never told about.
+- If STEP_IDENTIFIED reports a hard scene/location cut partway through the clip (different room, outfit, or day), treat the segments as separate movements, not one continuous phrase — never describe a "beginning" and "end" of "the movement" as if they connect across a cut, and say plainly that the clip contains more than one take if that's relevant to a finding.
 - When a step is named with numbering in the data, use that exact naming ('1st arabesque', '2nd attitude') and always pair it with its natural spoken timestamp in the same sentence — never one without the other when both are available.
-- Use real studio cueing language ('pull up the kneecap', 'stand taller through the crown', 'keep the hip over the foot', 'lengthen the back of the neck', 'reach the toes', 'lift the chest without pinching the lower back', 'bring the shoulder blade down and wide', 'straighten the standing leg', 'keep the weight over the middle of the foot', 'soften the knee', 'draw the leg out from the hip') rather than clinical or fitness wording ('engage', 'activate', 'deviation', 'compression', 'stabilize', 'anterior pelvic tilt', 'deviated alignment', 'muscle activation').
+- Give [VISUAL] findings the same real-vocabulary treatment as alignment findings: name what's actually being judged — pointed vs. sickled/flexed feet, depth and evenness of turnout, port de bras shape and arm lines, épaulement and head coordination, posture (pulled up through the spine vs. sinking into the standing leg), and overall carriage or artistry (stiff/tentative vs. fluid/confident) — rather than folding all of it into generic "alignment" language, which is a [DATA]-only concept.
+- Use real studio cueing language ('pull up the kneecap', 'stand taller through the crown', 'keep the hip over the foot', 'lengthen the back of the neck', 'reach the toes', 'point through the whole foot', 'work the turnout from the hip, not the knee or ankle', 'lift the chest without pinching the lower back', 'bring the shoulder blade down and wide', 'straighten the standing leg', 'keep the weight over the middle of the foot', 'soften the knee', 'draw the leg out from the hip') rather than clinical or fitness wording ('engage', 'activate', 'deviation', 'compression', 'stabilize', 'anterior pelvic tilt', 'deviated alignment', 'muscle activation').
 
 ━━━ PHYSICAL CAPABILITY COMPASSION RULE ━━━
 {physical_section}
@@ -516,13 +641,21 @@ For each finding that clears the evidence and relevance bar above, use this stru
 
 Order findings by how much they matter, most significant first. Fold anything below the relevance bar into a single short closing sentence instead of giving it its own block. The number of full findings should match what the evidence actually supports — that may be one, it may be several.
 
-After all findings, close with a brief, warm, personalised encouragement note that references their specific strengths and any genuine progress visible in this session. If there is no meaningful change from the last session, state that plainly instead of exaggerating progress."""
+After all findings, close with a brief, warm, personalised encouragement note that references their specific strengths (grounded in the STRENGTHS list) and any genuine progress visible in this session. If there is no meaningful change from the last session, state that plainly instead of exaggerating progress."""
+
+    material_header = (
+        "━━━ RAW MEDIAPIPE DATA (Gemini filtering step was unavailable — no video frames reached "
+        "this stage either — filter this yourself, applying the exact same evidence bar; the "
+        "strict step-naming ban applies since nothing here was visually confirmed) ━━━"
+        if used_fallback else
+        "━━━ GEMINI TECHNICAL SUMMARY (STEP_IDENTIFIED + [DATA]/[VISUAL]-tagged ISSUES & STRENGTHS) ━━━"
+    )
 
     user_message = f"""Dancer name: {username}
 Skill level: {skill_level}
 Physical notes / health specs: {health_specs if health_specs else 'None.'}
 
-━━━ GEMINI TECHNICAL ERROR SUMMARY ━━━
+{material_header}
 {gemini_summary}
 
 Please produce your full ballet coaching critique following the system output structure."""
@@ -555,6 +688,18 @@ Please produce your full ballet coaching critique following the system output st
 # ---------------------------------------------------------------------------
 # API Routes
 # ---------------------------------------------------------------------------
+def _friendly_error_text(exc: Exception) -> str:
+    error_text = str(exc).lower()
+    if "timeout" in error_text or "timed out" in error_text:
+        return "This is taking longer than expected. Please try again in a moment."
+    elif "503" in error_text or "unavailable" in error_text or "overloaded" in error_text or "rate limit" in error_text or "429" in error_text:
+        return "The AI coach is very busy right now. Please wait a minute and try again."
+    elif "connection" in error_text:
+        return "Couldn't reach the analysis server. Please check your connection and try again."
+    else:
+        return "Something went wrong on our end. Please try again in a few minutes."
+
+
 @app.route("/upload-ballet", methods=["POST"])
 def upload_ballet():
     print(
@@ -562,103 +707,122 @@ def upload_ballet():
         f"content_type={request.content_type}, content_length={request.content_length}",
         flush=True,
     )
-    tmp_path = None
 
-    try:
-        # Extract form parameters
-        username     = (request.form.get("username")     or "anonymous").strip()
-        device_id    = (request.form.get("device_id")    or username).strip()
-        skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
-        health_specs = (request.form.get("health_specs") or "").strip()
+    # Extract form parameters + validate video BEFORE we start streaming a
+    # response, so a bad request still gets a normal, immediate JSON 400 —
+    # streaming only starts once we know there's real work to do.
+    username     = (request.form.get("username")     or "anonymous").strip()
+    device_id    = (request.form.get("device_id")    or username).strip()
+    skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
+    health_specs = (request.form.get("health_specs") or "").strip()
 
-        # Validate video file
-        if "video" not in request.files:
-            print(
-                f"[400] /upload-ballet rejected: missing 'video' field; "
-                f"form_fields={list(request.form.keys())}, "
-                f"file_fields={list(request.files.keys())}, "
-                f"content_type={request.content_type}",
-                flush=True,
-            )
-            return jsonify({"error": "No video file provided. Include a 'video' field in the multipart form."}), 400
-
-        video_file = request.files["video"]
-        if not video_file or video_file.filename == "":
-            print(
-                f"[400] /upload-ballet rejected: empty video file; "
-                f"filename={getattr(video_file, 'filename', None)!r}, "
-                f"form_fields={list(request.form.keys())}, "
-                f"file_fields={list(request.files.keys())}",
-                flush=True,
-            )
-            return jsonify({"error": "Empty video file received."}), 400
-
-        # Save to a temp file
-        suffix   = os.path.splitext(video_file.filename or ".mp4")[1] or ".mp4"
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-        os.close(tmp_fd)
-
-        video_file.save(tmp_path)
-
-        # Load history and ballet rules
-        history_db   = load_history_db()
-        history_data = get_user_history_text(history_db, device_id)
-        ballet_rules = load_ballet_rules()
-
-        # Process video with MediaPipe
-        frames_data, fps, duration_s = process_video(tmp_path)
-
-        if not frames_data:
-            return jsonify({
-                "corrections": (
-                    "No pose was detected in your video. Please ensure:\n"
-                    "• The dancer's body (hips to head) is clearly visible throughout.\n"
-                    "• The room is well-lit with no strong backlighting.\n"
-                    "• You are wearing form-fitting dancewear (leotard and tights).\n\n"
-                    "Please re-upload with these conditions corrected."
-                )
-            })
-
-        timeline_text = build_timeline_summary(frames_data, duration_s)
-
-        # Step 1: Gemini data filter
-        gemini_summary = run_gemini_filter(timeline_text)
-
-        # Step 2: Claude coaching critique
-        critique = run_claude_coaching(
-            gemini_summary    = gemini_summary,
-            username          = username,
-            skill_level       = skill_level,
-            health_specs      = health_specs,
-            history_data      = history_data,
-            ballet_rules_text = ballet_rules,
+    if "video" not in request.files:
+        print(
+            f"[400] /upload-ballet rejected: missing 'video' field; "
+            f"form_fields={list(request.form.keys())}, "
+            f"file_fields={list(request.files.keys())}, "
+            f"content_type={request.content_type}",
+            flush=True,
         )
+        return jsonify({"error": "No video file provided. Include a 'video' field in the multipart form."}), 400
 
-        # Persist to history
-        save_user_critique(history_db, device_id, username, critique, skill_level, health_specs)
-        save_history_db(history_db)
+    video_file = request.files["video"]
+    if not video_file or video_file.filename == "":
+        print(
+            f"[400] /upload-ballet rejected: empty video file; "
+            f"filename={getattr(video_file, 'filename', None)!r}, "
+            f"form_fields={list(request.form.keys())}, "
+            f"file_fields={list(request.files.keys())}",
+            flush=True,
+        )
+        return jsonify({"error": "Empty video file received."}), 400
 
-        return jsonify({"corrections": critique})
+    suffix   = os.path.splitext(video_file.filename or ".mp4")[1] or ".mp4"
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(tmp_fd)
+    video_file.save(tmp_path)
 
-    except Exception as exc:
-        print(f"[500] /upload-ballet failed: {exc!r}", flush=True)
-        traceback.print_exc()
+    def generate():
+        """
+        Streams one JSON object per line as each real backend stage starts/
+        finishes, so the frontend can show the dancer what's ACTUALLY
+        happening instead of a canned timer animation. Always ends with
+        exactly one line carrying either "corrections" or "error".
+        """
+        try:
+            yield json.dumps({"stage": "video_processing"}) + "\n"
 
-        error_text = str(exc).lower()
-        if "timeout" in error_text or "timed out" in error_text:
-            friendly = "This is taking longer than expected. Please try again in a moment."
-        elif "503" in error_text or "unavailable" in error_text or "overloaded" in error_text or "rate limit" in error_text or "429" in error_text:
-            friendly = "The AI coach is very busy right now. Please wait a minute and try again."
-        elif "connection" in error_text:
-            friendly = "Couldn't reach the analysis server. Please check your connection and try again."
-        else:
-            friendly = "Something went wrong on our end. Please try again in a few minutes."
+            history_db   = load_history_db()
+            history_data = get_user_history_text(history_db, device_id)
+            ballet_rules = load_ballet_rules()
 
-        return jsonify({"error": friendly}), 500
+            frames_data, fps, duration_s = process_video(tmp_path)
 
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            if not frames_data:
+                yield json.dumps({
+                    "stage": "done",
+                    "corrections": (
+                        "No pose was detected in your video. Please ensure:\n"
+                        "• The dancer's body (hips to head) is clearly visible throughout.\n"
+                        "• The room is well-lit with no strong backlighting.\n"
+                        "• You are wearing form-fitting dancewear (leotard and tights).\n\n"
+                        "Please re-upload with these conditions corrected."
+                    )
+                }) + "\n"
+                return
+
+            timeline_text  = build_timeline_summary(frames_data, duration_s)
+            visual_frames  = extract_visual_frames(tmp_path)
+
+            yield json.dumps({"stage": "gemini_analysis"}) + "\n"
+
+            # Step 1: Gemini data filter — fuses the MediaPipe numeric
+            # timeline with actual sampled video frames, so it can name the
+            # step being danced and judge turnout/feet/artistry visually,
+            # not just report skeletal joint angles. If Gemini is down/
+            # overloaded after all retries, don't kill the whole request —
+            # fall back to handing Claude the raw MediaPipe timeline
+            # directly (no video frames in fallback mode) and having it do
+            # the filtering itself, under the same evidence rules.
+            used_fallback = False
+            try:
+                gemini_summary = run_gemini_filter(timeline_text, visual_frames)
+            except Exception as gemini_exc:
+                print(f"[WARN] Gemini unavailable after all retries, falling back to raw data for Claude: {gemini_exc!r}", flush=True)
+                gemini_summary = timeline_text
+                used_fallback  = True
+                yield json.dumps({"stage": "gemini_fallback"}) + "\n"
+
+            yield json.dumps({"stage": "claude_coaching"}) + "\n"
+
+            # Step 2: Claude coaching critique
+            critique = run_claude_coaching(
+                gemini_summary    = gemini_summary,
+                username          = username,
+                skill_level       = skill_level,
+                health_specs      = health_specs,
+                history_data      = history_data,
+                ballet_rules_text = ballet_rules,
+                used_fallback     = used_fallback,
+            )
+
+            yield json.dumps({"stage": "saving"}) + "\n"
+
+            save_user_critique(history_db, device_id, username, critique, skill_level, health_specs)
+            save_history_db(history_db)
+
+            yield json.dumps({"stage": "done", "corrections": critique}) + "\n"
+
+        except Exception as exc:
+            print(f"[500] /upload-ballet failed: {exc!r}", flush=True)
+            traceback.print_exc()
+            yield json.dumps({"stage": "done", "error": _friendly_error_text(exc)}) + "\n"
+
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
 
 
 @app.route("/ping", methods=["GET"])
@@ -685,4 +849,7 @@ if __name__ == "__main__":
     print(f"  Health check     : GET  http://0.0.0.0:{port}/ping")
     print("=" * 62 + "\n")
 
-    app.run(debug=False, host='0.0.0.0', port=int(port))
+    # threaded=True lets the dev server handle a second request's network I/O
+    # (Gemini/Claude API calls) while the first is still mid-processing,
+    # instead of one upload blocking/starving every other request.
+    app.run(debug=False, host='0.0.0.0', port=int(port), threaded=True)
