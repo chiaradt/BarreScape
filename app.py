@@ -19,6 +19,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks_python
 from mediapipe.tasks.python import vision as mp_vision
 from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from google import genai
 from google.genai import types
@@ -453,6 +454,7 @@ def run_gemini_filter(timeline_text: str, visual_frames: list) -> str:
     which claims are eyeballed vs. measured.
     """
 
+
     client = genai.Client(
         api_key=GOOGLE_API_KEY,
         http_options=types.HttpOptions(timeout=45_000),
@@ -551,8 +553,10 @@ def run_claude_coaching(
     history_data:      str,
     ballet_rules_text: str,
     used_fallback:     bool = False,
+    used_fallback:     bool = False,
 ) -> str:
     """
+    Step 2 — Claude 3.5 Sonnet: transforms Gemini's ISSUES/STRENGTHS lists into
     Step 2 — Claude 3.5 Sonnet: transforms Gemini's ISSUES/STRENGTHS lists into
     a warm, structured somatic coaching critique.
     """
@@ -588,6 +592,7 @@ Mention improvement only when there is a clear, meaningful difference supported 
     system_prompt = f"""You are an expert classical ballet coach and somatic alignment specialist trained in both the Vaganova and RAD methodologies. You are warm, clear, encouraging, and highly precise.
 
 ━━━ NATIVE BALLET KNOWLEDGE (PRIMARY BRAIN) ━━━
+Rely fully on your encyclopedic, native understanding of classical ballet terminology, positions, placement, and anatomy. You know what a correct Plié, Arabesque, Attitude, Pas de Basque, Grand Battement, Pirouette, Port de Bras, and all fundamental positions look and feel like. Use this knowledge as your primary evaluative framework for HOW to coach a finding — not as a source of what actually happened in this specific clip (see EVIDENCE & RELEVANCE below).
 Rely fully on your encyclopedic, native understanding of classical ballet terminology, positions, placement, and anatomy. You know what a correct Plié, Arabesque, Attitude, Pas de Basque, Grand Battement, Pirouette, Port de Bras, and all fundamental positions look and feel like. Use this knowledge as your primary evaluative framework for HOW to coach a finding — not as a source of what actually happened in this specific clip (see EVIDENCE & RELEVANCE below).
 
 ━━━ CUSTOM CAMERA TRANSLATION LENSES (EQUAL WEIGHT) ━━━
@@ -656,6 +661,7 @@ Skill level: {skill_level}
 Physical notes / health specs: {health_specs if health_specs else 'None.'}
 
 {material_header}
+{material_header}
 {gemini_summary}
 
 Please produce your full ballet coaching critique following the system output structure."""
@@ -700,6 +706,18 @@ def _friendly_error_text(exc: Exception) -> str:
         return "Something went wrong on our end. Please try again in a few minutes."
 
 
+def _friendly_error_text(exc: Exception) -> str:
+    error_text = str(exc).lower()
+    if "timeout" in error_text or "timed out" in error_text:
+        return "This is taking longer than expected. Please try again in a moment."
+    elif "503" in error_text or "unavailable" in error_text or "overloaded" in error_text or "rate limit" in error_text or "429" in error_text:
+        return "The AI coach is very busy right now. Please wait a minute and try again."
+    elif "connection" in error_text:
+        return "Couldn't reach the analysis server. Please check your connection and try again."
+    else:
+        return "Something went wrong on our end. Please try again in a few minutes."
+
+
 @app.route("/upload-ballet", methods=["POST"])
 def upload_ballet():
     print(
@@ -715,7 +733,23 @@ def upload_ballet():
     device_id    = (request.form.get("device_id")    or username).strip()
     skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
     health_specs = (request.form.get("health_specs") or "").strip()
+    # Extract form parameters + validate video BEFORE we start streaming a
+    # response, so a bad request still gets a normal, immediate JSON 400 —
+    # streaming only starts once we know there's real work to do.
+    username     = (request.form.get("username")     or "anonymous").strip()
+    device_id    = (request.form.get("device_id")    or username).strip()
+    skill_level  = (request.form.get("skill_level")  or "Adult / Recreational Beginner").strip()
+    health_specs = (request.form.get("health_specs") or "").strip()
 
+    if "video" not in request.files:
+        print(
+            f"[400] /upload-ballet rejected: missing 'video' field; "
+            f"form_fields={list(request.form.keys())}, "
+            f"file_fields={list(request.files.keys())}, "
+            f"content_type={request.content_type}",
+            flush=True,
+        )
+        return jsonify({"error": "No video file provided. Include a 'video' field in the multipart form."}), 400
     if "video" not in request.files:
         print(
             f"[400] /upload-ballet rejected: missing 'video' field; "
@@ -736,7 +770,21 @@ def upload_ballet():
             flush=True,
         )
         return jsonify({"error": "Empty video file received."}), 400
+    video_file = request.files["video"]
+    if not video_file or video_file.filename == "":
+        print(
+            f"[400] /upload-ballet rejected: empty video file; "
+            f"filename={getattr(video_file, 'filename', None)!r}, "
+            f"form_fields={list(request.form.keys())}, "
+            f"file_fields={list(request.files.keys())}",
+            flush=True,
+        )
+        return jsonify({"error": "Empty video file received."}), 400
 
+    suffix   = os.path.splitext(video_file.filename or ".mp4")[1] or ".mp4"
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(tmp_fd)
+    video_file.save(tmp_path)
     suffix   = os.path.splitext(video_file.filename or ".mp4")[1] or ".mp4"
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     os.close(tmp_fd)
@@ -755,7 +803,21 @@ def upload_ballet():
             history_db   = load_history_db()
             history_data = get_user_history_text(history_db, device_id)
             ballet_rules = load_ballet_rules()
+    def generate():
+        """
+        Streams one JSON object per line as each real backend stage starts/
+        finishes, so the frontend can show the dancer what's ACTUALLY
+        happening instead of a canned timer animation. Always ends with
+        exactly one line carrying either "corrections" or "error".
+        """
+        try:
+            yield json.dumps({"stage": "video_processing"}) + "\n"
 
+            history_db   = load_history_db()
+            history_data = get_user_history_text(history_db, device_id)
+            ballet_rules = load_ballet_rules()
+
+            frames_data, fps, duration_s = process_video(tmp_path)
             frames_data, fps, duration_s = process_video(tmp_path)
 
             if not frames_data:
@@ -805,14 +867,33 @@ def upload_ballet():
                 ballet_rules_text = ballet_rules,
                 used_fallback     = used_fallback,
             )
+            # Step 2: Claude coaching critique
+            critique = run_claude_coaching(
+                gemini_summary    = gemini_summary,
+                username          = username,
+                skill_level       = skill_level,
+                health_specs      = health_specs,
+                history_data      = history_data,
+                ballet_rules_text = ballet_rules,
+                used_fallback     = used_fallback,
+            )
 
+            yield json.dumps({"stage": "saving"}) + "\n"
+
+            save_user_critique(history_db, device_id, username, critique, skill_level, health_specs)
+            save_history_db(history_db)
             yield json.dumps({"stage": "saving"}) + "\n"
 
             save_user_critique(history_db, device_id, username, critique, skill_level, health_specs)
             save_history_db(history_db)
 
             yield json.dumps({"stage": "done", "corrections": critique}) + "\n"
+            yield json.dumps({"stage": "done", "corrections": critique}) + "\n"
 
+        except Exception as exc:
+            print(f"[500] /upload-ballet failed: {exc!r}", flush=True)
+            traceback.print_exc()
+            yield json.dumps({"stage": "done", "error": _friendly_error_text(exc)}) + "\n"
         except Exception as exc:
             print(f"[500] /upload-ballet failed: {exc!r}", flush=True)
             traceback.print_exc()
@@ -821,6 +902,11 @@ def upload_ballet():
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
 
     return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
 
